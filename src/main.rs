@@ -23,17 +23,22 @@ async fn main() -> GenericResult<()>{
     // futures::executor::block_on(download_future).expect("Failed!");
 
     dotenv::dotenv().or(Err(simple_error!("'.env' file with credentials not found.")))?;
+    let username = &std::env::var("TUM_USERNAME")?;
+    let password = &std::env::var("TUM_PASSWORD")?;
     
     
-    let moodle_auth_cookies = moodle_login(
-        &std::env::var("TUM_USERNAME")?,
-        &std::env::var("TUM_PASSWORD")?)
-        .await.unwrap();
+    let moodle_auth_cookies = moodle_login(username, password).await?;
     
-    let course_url = "https://www.moodle.tum.de/course/view.php?id=57976"; // Intro 2 QC
-    // let course_url = "https://www.moodle.tum.de/course/view.php?idnumber=950576833"; // Programming Languages
+    // let course_url = "https://www.moodle.tum.de/course/view.php?id=57976"; // Intro 2 QC
+    let course_url = "https://www.moodle.tum.de/course/view.php?idnumber=950576833"; // Programming Languages
 
-    detect_moodle_videos(course_url, moodle_auth_cookies.clone()).await?; 
+    detect_moodle_videos(course_url, moodle_auth_cookies.clone()).await?;
+
+    let tum_live_auth_cookies = tum_live_login(username, password).await?;
+
+    let course_url = "https://live.rbg.tum.de/course/2021/W/Sem";
+
+    detect_tum_live_videos(course_url, tum_live_auth_cookies).await?;
 
     Ok(())
 }
@@ -42,7 +47,8 @@ async fn main() -> GenericResult<()>{
 enum CourseVideo {
     TumLiveStream {
         url: String,
-        lecture_name: String,
+        lecture_title: String,
+        video_title: String,
         date_time_string: String
     },
     MoodleVideoFile {
@@ -78,7 +84,7 @@ async fn download_mp4(resp: reqwest::Response) -> GenericResult<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        writer.write(&chunk?).unwrap();
+        writer.write(&chunk?)?;
     }
     Ok(())
 }
@@ -86,7 +92,7 @@ async fn download_mp4(resp: reqwest::Response) -> GenericResult<()> {
 async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseVideo>> {
     let client = reqwest::Client::builder()
         .cookie_provider(moodle_auth_cookies.clone())
-        .build().unwrap();
+        .build()?;
         
     let resp = client.get(course_url).send().await?;
     let course_page_dom = Document::from(resp.text().await?.as_str());
@@ -172,7 +178,7 @@ fn extract_html_input_value<'a>(document: &'a Document, input_name: &str) -> Gen
 }
 
 async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<CookieStoreMutex>> {
-    // Shibboleth login need to store cookies, so our client needs a cookie store
+    // Shibboleth login needs to store cookies, so our client needs a cookie store
     let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::default());
     
     // Build a `reqwest` Client that uses the cookie store
@@ -222,6 +228,52 @@ async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<Cooki
     }
 }
 
+async fn tum_live_login(username: &str, password: &str) -> GenericResult<Arc<CookieStoreMutex>> {
+    // Login needs to store cookies, so our client needs a cookie store
+    let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::default());
+    
+    // Build a `reqwest` Client that uses the cookie store
+    let client = reqwest::Client::builder()
+        .cookie_provider(cookie_store.clone())
+        .build()?;
+
+    const TUM_LIVE_LOGIN_URL: &str = "https://live.rbg.tum.de/login";
+    let params = [("username", username), ("password", password)];
+    let resp = client.post(TUM_LIVE_LOGIN_URL).form(&params).send().await?;
+
+    if resp.status().is_success() {
+        Ok(cookie_store)
+    } else {
+        Err(simple_error!("TUM Live login not successful.").into())
+    }
+}
+
+async fn detect_tum_live_videos(course_url: &str, tum_live_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseVideo>> {
+    let client = reqwest::Client::builder()
+        .cookie_provider(tum_live_auth_cookies.clone())
+        .build()?;
+    
+    let resp = client.get(course_url).send().await?;
+    let course_page_dom = Document::from(resp.text().await?.as_str());
+
+    let lecture_title = course_page_dom.find(Class("text-1")).next().map(|node| node.text().trim().to_owned()).unwrap_or_default();
+
+    let recording_nodes = course_page_dom.find(Name("a").and(Class("text-3")).and(Attr("href", ())));
+    let course_videos = recording_nodes.map(|node| {
+        let video_url = node.attr("href").unwrap().to_owned();
+        let video_title = node.text().trim().to_owned();
+        let date_time_string = node.parent()
+            .and_then(|parent| parent.parent())
+            .and_then(|parent| parent.find(Class("text-5").child(Text)).last())
+            .map(|date_time_node| date_time_node.text().trim().to_owned())
+            .unwrap_or_default();
+        CourseVideo::TumLiveStream {
+            url: video_url, video_title, date_time_string, lecture_title: lecture_title.clone()
+        }
+    }).collect();
+
+    Ok(course_videos)
+}
 
 async fn process_lecture(lecture_page_url: &str) -> Result<(), reqwest::Error> {
     let body = reqwest::get(lecture_page_url).await?
