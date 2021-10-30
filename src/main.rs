@@ -1,6 +1,7 @@
 use std::io::BufWriter;
+use futures::TryStreamExt;
 use std::path::Path;
-use futures::stream::FuturesUnordered;
+use futures::stream::{FuturesUnordered, FuturesOrdered};
 use reqwest;
 use regex::Regex;
 use std::error::Error;
@@ -13,7 +14,7 @@ use futures::stream::StreamExt;
 use select::document::Document;
 use select::predicate::{Predicate, Attr, Class, Name, Text};
 use simple_error::simple_error;
-use envfile::EnvFile;
+use reqwest_cookie_store::CookieStoreMutex;
 
 #[tokio::main]
 async fn main() -> GenericResult<()>{
@@ -21,26 +22,49 @@ async fn main() -> GenericResult<()>{
     // let download_future = download_video(m3u8_url, "out.mp4").await;
     // futures::executor::block_on(download_future).expect("Failed!");
 
-    let credentials = EnvFile::new("credentials.env")?;
-    // let credentials = [("username", credentials_envfile.get("username")), 
-    //     ("password", credentials_envfile.get("password"))];
-
+    dotenv::dotenv().or(Err(simple_error!("'.env' file with credentials not found.")))?;
+    
+    
     let moodle_auth_cookies = moodle_login(
-        credentials.get("username").ok_or(simple_error!("'username' missing from credentials.env file"))?,
-        credentials.get("password").ok_or(simple_error!("'password' missing from credentials.env file"))?)
+        &std::env::var("TUM_USERNAME")?,
+        &std::env::var("TUM_PASSWORD")?)
         .await.unwrap();
-    moodle_download_mp4s(moodle_auth_cookies).await.unwrap();
+    
+    let course_url = "https://www.moodle.tum.de/course/view.php?id=57976"; // Intro 2 QC
+    // let course_url = "https://www.moodle.tum.de/course/view.php?idnumber=950576833"; // Programming Languages
+
+    detect_moodle_videos(course_url, moodle_auth_cookies.clone()).await?; 
 
     Ok(())
 }
 
+#[derive(Debug)]
+enum CourseVideo {
+    TumLiveStream {
+        url: String,
+        lecture_name: String,
+        date_time_string: String
+    },
+    MoodleVideoFile {
+        url: String,
+        lecture_title: String,
+        section_title: String,
+        video_title: String
+    },
+    PanoptoVideoFile {
+        url: String,
+        lecture_title: String,
+        section_title: String,
+        video_title: String
+    }
+}
 
 /* TODOs
 - parse live.rgb.tum lecture page, extract m3u8 urls
 - (parse general live.rgb.tum page to display available lectures)
 */
 
-type GenericError = Box<dyn Error>;
+type GenericError = Box<dyn Error + Send + Sync + 'static>;
 type GenericResult<T> = Result<T, GenericError>;
 
 async fn download_mp4(resp: reqwest::Response) -> GenericResult<()> {
@@ -59,56 +83,85 @@ async fn download_mp4(resp: reqwest::Response) -> GenericResult<()> {
     Ok(())
 }
 
-async fn moodle_download_mp4s(moodle_auth_cookies: Arc<reqwest_cookie_store::CookieStoreMutex>) -> GenericResult<()> {
+async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseVideo>> {
     let client = reqwest::Client::builder()
         .cookie_provider(moodle_auth_cookies.clone())
         .build().unwrap();
-    // let course_url = "https://www.moodle.tum.de/course/view.php?id=68910";
-    let course_url = "https://www.moodle.tum.de/course/view.php?id=57976";
+        
     let resp = client.get(course_url).send().await?;
     let course_page_dom = Document::from(resp.text().await?.as_str());
 
-    let panopto_video_url_regex; // Define before download_futures s.t. it is not dropped and referencing the Regex from a closure succeeds
+    // Define before download_futures s.t. it is not dropped and referencing the Regex from a closure succeeds
+    let panopto_video_url_regex = Regex::new(r#""VideoUrl":"(.*?)""#)?;
+    let mut detect_futures: FuturesOrdered<futures::future::BoxFuture<_>> = FuturesOrdered::new();
 
-    let mut download_futures: FuturesUnordered<futures::future::BoxFuture<_>> = FuturesUnordered::new();
+    let lecture_title = course_page_dom.find(Class("page-header-headings")).next().unwrap().text();
 
-    if !Path::new("./download").exists() {
-        create_dir("./download")?;
-    }
+    // Iterate through main sections to capture their titles
+    for section_node in course_page_dom.find(Class("section").and(Class("main"))) {
+        let section_title = section_node.find(Class("sectionname")).next().map_or(String::default(), |n| n.text());
 
-    for activity_instance in course_page_dom.find(Class("activityinstance")) {
-        // dbg!(activity_instance.find(Class("instancename")).next().map(|x| x.text()));
-        let activity_url = activity_instance.find(Name("a")).next().unwrap().attr("href").unwrap();
-        let resp_future = client.get(activity_url)
-            .send().err_into::<GenericError>()
-            .and_then(download_mp4);
-        download_futures.push(Box::pin(resp_future));        
-        if download_futures.len() >= 5 {
-            download_futures.next().await;
+        // Iterate through nodes that could be videos
+        for video_node in section_node.find(
+                Class("activityinstance") // Match videos that are directly linked as activity
+                .or(Name("iframe").and(Attr("src", ())))) // Match embedded Panoptop players
+            {
+            let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
+
+            // Video that is directly linked as mp4
+            if let Some("activityinstance") = video_node.attr("class") {
+                let activity_url = video_node.find(Name("a")).next().unwrap().attr("href").unwrap();
+                let video_title = video_node.find(Class("instancename")).next().unwrap().text(); //.map(|x| x.text())
+                let detect_video_future = client.get(activity_url)
+                    .send().err_into::<GenericError>()
+                    .map_ok(|resp| {
+                        let url = resp.url().to_string();
+                        if url.ends_with("mp4") {
+                            Some(CourseVideo::MoodleVideoFile {
+                                url, lecture_title, section_title, video_title})
+                        } else { None }});
+                detect_futures.push(Box::pin(detect_video_future));
+            }
+            // Video in embedded Panopto player
+            else if video_node.name() == Some("iframe") && video_node.attr("src").unwrap().contains("panopto") {
+                // Recieve embedded player HTML and extract video url and title from it
+                let panopto_url = video_node.attr("src").unwrap();
+                let detect_video_future = client.get(panopto_url).send().err_into::<GenericError>()
+                    .and_then(|resp| resp.text().err_into::<GenericError>())
+                    .map_ok(|text| {
+                        let panopto_dom = Document::from(text.as_str());
+
+                        // The title is found in a heading with id 'title'
+                        let video_title = panopto_dom.find(Attr("id", "title"))
+                            .next().map_or(String::new(), |title| title.text().trim().to_owned());
+
+                        // The url pointing to the video in mp4 format is found hardcoded in the embedded
+                        // <script>, which is matched by `panopto_video_url_regex`
+                        panopto_video_url_regex.captures(&text)
+                            .and_then(|captures| captures.get(1))
+                            .map(move |url_match| {
+                                // In the JavaScript code, / is escaped as \/
+                                let video_url = url_match.as_str().replace("\\/", "/");
+                                CourseVideo::PanoptoVideoFile {url: video_url, lecture_title, section_title, video_title }
+                            })
+                    });
+                detect_futures.push(Box::pin(detect_video_future));
+            }
         }
     }
 
-    panopto_video_url_regex = Regex::new(r#""VideoUrl":"(.*?)""#).unwrap();
-
-    for panopto_iframe in course_page_dom.find(Name("iframe").and(Attr("src", ()))) {
-        let panopto_url = panopto_iframe.attr("src").unwrap();
-        let resp_future = client.get(panopto_url).send()
-            .then(|resp| async {
-                let panopto_frame_html = resp.unwrap().text().await.unwrap();
-                let video_url = panopto_video_url_regex.captures(&panopto_frame_html)
-                    .unwrap()[1].replace("\\/", "/");
-                // dbg!(video_url);
-                client.get(video_url).send().err_into::<GenericError>().await
-            })
-            .and_then(download_mp4);
-        download_futures.push(Box::pin(resp_future));        
-        if download_futures.len() >= 5 {
-            download_futures.next().await;
+    let mut course_videos = vec![];
+    while let Some(result) = detect_futures.next().await {
+        match result {
+            Ok(Some(course_video)) => {
+                course_videos.push(course_video);
+            },
+            Ok(None) => {} // Ignore (e.g. pdf instead of mp4 files)
+            error@Err(_) => { error?; } // Like this for now, but just skipping would also be an option
         }
     }
-    while let Some(_) = download_futures.next().await {}
-
-    Ok(())
+    
+    Ok(course_videos)
 }
 
 fn extract_html_input_value<'a>(document: &'a Document, input_name: &str) -> GenericResult<&'a str> {
@@ -118,7 +171,7 @@ fn extract_html_input_value<'a>(document: &'a Document, input_name: &str) -> Gen
         .ok_or(simple_error!("Could not find input with name '{}' and a 'value' attribute", input_name).into())
 }
 
-async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<reqwest_cookie_store::CookieStoreMutex>> {
+async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<CookieStoreMutex>> {
     // Shibboleth login need to store cookies, so our client needs a cookie store
     let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::default());
     

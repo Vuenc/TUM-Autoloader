@@ -13,4 +13,4 @@ tokio = { version = "1", features = ["full"] }
 reqwest_cookie_store = "0.2.0"
 select = "0.5.0"
 simple-error = "0.2.3"
-envfile = "0.2.1"
+dotenv = "0.15.0"
