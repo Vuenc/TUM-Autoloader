@@ -1,0 +1,16 @@
+[package]
+name = "TUM-video-autoloader"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+reqwest = { version = "0.11.6", features = ["stream"] }
+regex = "1"
+futures = "0.3.17"
+tokio = { version = "1", features = ["full"] }
+reqwest_cookie_store = "0.2.0"
+select = "0.5.0"
+simple-error = "0.2.3"
+envfile = "0.2.1"
