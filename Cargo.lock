@@ -3,20 +3,6 @@
 version = 3
 
 [[package]]
-name = "TUM-video-autoloader"
-version = "0.1.0"
-dependencies = [
- "dotenv",
- "futures",
- "regex",
- "reqwest",
- "reqwest_cookie_store",
- "select",
- "simple-error",
- "tokio",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1440,6 +1426,20 @@ name = "try-lock"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59547bce71d9c38b83d9c0e92b6066c4253371f15005def0c30d9657f50c7642"
+
+[[package]]
+name = "tum_autoloader"
+version = "0.1.0"
+dependencies = [
+ "dotenv",
+ "futures",
+ "regex",
+ "reqwest",
+ "reqwest_cookie_store",
+ "select",
+ "simple-error",
+ "tokio",
+]
 
 [[package]]
 name = "unicode-bidi"

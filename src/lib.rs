@@ -10,5 +10,5 @@ pub mod tum_live;
 - (parse general live.rgb.tum page to display available lectures)
 */
 
-type GenericError = Box<dyn Error + Send + Sync + 'static>;
-type GenericResult<T> = Result<T, GenericError>;
+pub type GenericError = Box<dyn Error + Send + Sync + 'static>;
+pub type GenericResult<T> = Result<T, GenericError>;

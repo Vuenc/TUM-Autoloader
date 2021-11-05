@@ -1,5 +1,5 @@
 [package]
-name = "TUM-video-autoloader"
+name = "tum_autoloader"
 version = "0.1.0"
 edition = "2018"
 
