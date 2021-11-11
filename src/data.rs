@@ -1,6 +1,6 @@
+use serde::{Serialize, Deserialize};
 
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CourseVideo {
     TumLiveStream {
         url: String,
@@ -28,6 +28,14 @@ impl CourseVideo {
             CourseVideo::TumLiveStream { url, ..} => url,
             CourseVideo::MoodleVideoFile { url, ..} => url,
             CourseVideo::PanoptoVideoFile { url, ..} => url,
+        }
+    }
+
+    pub fn video_title(&self) -> &str {
+        match self {
+            CourseVideo::TumLiveStream { video_title, ..} => video_title,
+            CourseVideo::MoodleVideoFile { video_title, ..} => video_title,
+            CourseVideo::PanoptoVideoFile { video_title, ..} => video_title,
         }
     }
 }
