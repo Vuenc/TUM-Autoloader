@@ -1,20 +1,19 @@
 use std::{fs, io::BufWriter};
-use std::path::Path;
+use std::path::{PathBuf};
 use reqwest;
 use std::{fs::File, io::Write, env::temp_dir};
 use futures::{self, TryFutureExt, stream::{FuturesUnordered, StreamExt}};
-use simple_error::simple_error;
 
 use crate::GenericResult;
 
-pub async fn download_mp4(resp: reqwest::Response) -> GenericResult<()> {
+pub async fn download_mp4(resp: reqwest::Response, path: PathBuf) -> GenericResult<()> {
     // let resp = resp?; Result<reqwest::Response, reqwest::Error>
-    let filename = resp.url().to_string().split("/").last().ok_or(simple_error!("URL has no '/'"))?.to_owned();
-    dbg!(&filename);
-    if !filename.ends_with("mp4") {
-        return Ok(())
-    }
-    let path = Path::new("../../Studium/TUM Recordings/").join(filename);
+    // let filename = resp.url().to_string().split("/").last().ok_or(simple_error!("URL has no '/'"))?.to_owned();
+    // dbg!(&filename);
+    // if !filename.ends_with("mp4") {
+    //     return Ok(())
+    // }
+    // let path = Path::new("../../Studium/TUM Recordings/").join(filename);
     let mut writer = BufWriter::new(File::create(path)?);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
