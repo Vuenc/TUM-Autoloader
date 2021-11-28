@@ -7,7 +7,7 @@ use select::{document::Document,
 use simple_error::simple_error;
 use reqwest_cookie_store::CookieStoreMutex;
 
-use crate::{GenericResult, GenericError};
+use crate::{GenericError, GenericResult, data::{CourseVideoMetadata, CourseVideoResource}};
 use crate::data::CourseVideo;
 
 pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseVideo>> {
@@ -43,10 +43,8 @@ pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<Coo
                         .send().err_into::<GenericError>()
                         .map_ok(|resp| {
                             let url = resp.url().to_string();
-                            if url.ends_with("mp4") {
-                                Some(CourseVideo::MoodleVideoFile {
-                                    url, lecture_title, section_title, video_title})
-                            } else { None }});
+                            moodle_course_video(url, lecture_title, section_title, video_title)
+                        });
                     detect_futures.push(Box::pin(detect_video_future));
                 }
                 // Video in embedded Panopto player
@@ -67,10 +65,10 @@ pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<Coo
                             // <script>, which is matched by `panopto_video_url_regex`
                             panopto_video_url_regex.captures(&text)
                                 .and_then(|captures| captures.get(1))
-                                .map(move |url_match| {
+                                .and_then(move |url_match| {
                                     // In the JavaScript code, / is escaped as \/
                                     let video_url = url_match.as_str().replace("\\/", "/");
-                                    CourseVideo::PanoptoVideoFile {url: video_url, lecture_title, section_title, video_title }
+                                    moodle_course_video(video_url, lecture_title, section_title, video_title)
                                 })
                         });
                     detect_futures.push(Box::pin(detect_video_future));
@@ -91,6 +89,16 @@ pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<Coo
     }
     
     Ok(course_videos)
+}
+
+fn moodle_course_video(url: String, lecture_title: String, section_title: String, video_title: String) -> Option<CourseVideo> {
+    let metadata = CourseVideoMetadata::MoodleVideo { lecture_title, section_title, video_title };
+    let resource = if url.ends_with("mp4") { 
+        Some(CourseVideoResource::Mp4File {url}) 
+    } else if url.ends_with("m3u8") {
+        Some(CourseVideoResource::HlsStream {main_m3u8_url: url})
+    } else { None };
+    resource.map(|resource| CourseVideo { metadata, resource })
 }
 
 fn extract_html_input_value<'a>(document: &'a Document, input_name: &str) -> GenericResult<&'a str> {

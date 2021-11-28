@@ -1,45 +1,92 @@
-use std::path::{PathBuf};
+use std::{fmt::Display, path::{PathBuf}};
 use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CourseVideo {
+#[derive(Serialize, Deserialize)]
+pub enum CourseVideoMetadata {
     TumLiveStream {
-        url: String,
         lecture_title: String,
         video_title: String,
         date_time_string: String
     },
-    MoodleVideoFile {
-        url: String,
+    MoodleVideo {
         lecture_title: String,
         section_title: String,
         video_title: String
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum CourseDocumentMetadata {
+    MoodleDocument {
+        lecture_title: String,
+        section_title: String,
+        video_title: String
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+pub enum CourseVideoResource {
+    Mp4File {
+        url: String
     },
-    PanoptoVideoFile {
-        url: String,
-        lecture_title: String,
-        section_title: String,
-        video_title: String
+    HlsStream {
+        main_m3u8_url: String
     }
 }
 
-impl CourseVideo {
-    pub fn url(&self) -> &str {
-        match self {
-            CourseVideo::TumLiveStream { url, ..} => url,
-            CourseVideo::MoodleVideoFile { url, ..} => url,
-            CourseVideo::PanoptoVideoFile { url, ..} => url,
-        }
-    }
+#[derive(Serialize, Deserialize, PartialEq)]
+pub struct CourseDocumentResource {
+    pub url: String,
+    pub filetype: String
+}
 
-    pub fn video_title(&self) -> &str {
+#[derive(Serialize, Deserialize)]
+pub struct CourseVideo {
+    pub resource: CourseVideoResource,
+    pub metadata: CourseVideoMetadata
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CourseDocument {
+    pub resource: CourseDocumentResource,
+    pub metadata: CourseVideoMetadata
+}
+
+impl Display for CourseVideoMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CourseVideo::TumLiveStream { video_title, ..} => video_title,
-            CourseVideo::MoodleVideoFile { video_title, ..} => video_title,
-            CourseVideo::PanoptoVideoFile { video_title, ..} => video_title,
+            CourseVideoMetadata::TumLiveStream { lecture_title, video_title, .. }
+            | CourseVideoMetadata::MoodleVideo { lecture_title, video_title, .. }  => {
+                write!(f, "{} - {}", lecture_title, video_title)
+            }
         }
     }
 }
+
+/// For now: Two videos are considered equal if they point to the same resource, ignoring the metadata
+impl PartialEq for CourseVideo {
+    fn eq(&self, other: &Self) -> bool {
+        self.resource == other.resource
+    }
+}
+
+// impl CourseVideo {
+//     pub fn url(&self) -> &str {
+//         match self {
+//             CourseVideo::TumLiveStream { url, ..} => url,
+//             CourseVideo::MoodleVideoFile { url, ..} => url,
+//             CourseVideo::PanoptoVideoFile { url, ..} => url,
+//         }
+//     }
+
+//     pub fn video_title(&self) -> &str {
+//         match self {
+//             CourseVideo::TumLiveStream { video_title, ..} => video_title,
+//             CourseVideo::MoodleVideoFile { video_title, ..} => video_title,
+//             CourseVideo::PanoptoVideoFile { video_title, ..} => video_title,
+//         }
+//     }
+// }
 
 #[derive(PartialEq, Serialize, Deserialize)]
 pub enum AutoDownloadMode {

@@ -1,12 +1,9 @@
 use std::{path::{Path, PathBuf}, pin::Pin};
 
 use futures::{Future, StreamExt, TryFutureExt, stream::{FuturesOrdered}};
-use tum_autoloader::{GenericError, GenericResult, 
-    download::{download_mp4},
-    moodle::{moodle_login, detect_moodle_videos},
-    tum_live::{tum_live_login, detect_tum_live_videos}};
+use tum_autoloader::{GenericError, GenericResult, data::CourseVideoResource, download::{download_mp4}, moodle::{moodle_login, detect_moodle_videos}, tum_live::{tum_live_login, detect_tum_live_videos}};
 use simple_error::simple_error;
-use tum_autoloader::data::{Course, CourseFileDownload, CourseVideo, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
+use tum_autoloader::data::{Course, CourseFileDownload, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
 use serde_json;
 use tum_autoloader::postprocessing::perform_postprocessing_step;
 use structopt::StructOpt;
@@ -90,7 +87,7 @@ async fn main() -> GenericResult<()>{
                 for (course_index, video_index, error) in failed_downloads {
                     let course = &courses[*course_index];
                     let video = &course.videos[*video_index].file;
-                    println!("Download of {} - {} failed:", course.name, video.video_title());
+                    println!("Download of {} failed:", video.metadata);
                     println!("{}", error);
                 }
             }
@@ -116,7 +113,7 @@ async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_pa
                 // Deduplicate found videos and update availability information
                 for existing_course_video in &mut course.videos {
                     if let Some((i, _)) = moodle_videos.iter().enumerate().find(
-                            |(_, v)| v.url() == existing_course_video.file.url()) {
+                            |(_, v)| **v == existing_course_video.file) {
                         moodle_videos.remove(i);
                     } else {
                         existing_course_video.available = false;
@@ -132,9 +129,15 @@ async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_pa
                         discovery_time: chrono::Utc::now(),
                         download_time: None
                     };
-                    assert!(video_download_data.file.url().ends_with("mp4"));
-                    course.videos.push(video_download_data);
-                    new_videos_count += 1;
+                    // dbg!(&video_download_data);
+                    // assert!(video_download_data.file.url().ends_with("mp4"));
+                    if let CourseVideoResource::Mp4File {..} = video_download_data.file.resource {
+                        course.videos.push(video_download_data);
+                        new_videos_count += 1;
+                    } else {
+                        println!("Warning - non-mp4 file not supported:");
+                        // println!("{:?}", video_download_data);
+                    }
                 }
                 
             },
@@ -163,8 +166,8 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
                 // Mark download as attempted, construct a download future depending on the video type.
                 attempted_downloads_indices.push((i, j));
                 let download_future: Pin<Box<dyn Future<Output = GenericResult<()>>>> =
-                match &video.file {
-                    CourseVideo::MoodleVideoFile { url, .. } => {
+                match &video.file.resource {
+                    CourseVideoResource::Mp4File { url, .. } => {
                         // For moodle videos: identify target filename from url
                         match url.split("/").last() {
                             Some(filename) => {
@@ -183,8 +186,7 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
                             }
                         }
                     },
-                    CourseVideo::TumLiveStream { url, lecture_title, video_title, date_time_string } => todo!(),
-                    CourseVideo::PanoptoVideoFile { url, lecture_title, section_title, video_title } => todo!(),
+                    CourseVideoResource::HlsStream { main_m3u8_url } => todo!(),
                 };
                 // Push download future into running queue
                 download_futures.push(download_future);

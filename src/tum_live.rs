@@ -4,7 +4,7 @@ use select::{document::Document, predicate::{Predicate, Attr, Class, Name, Text}
 use simple_error::simple_error;
 use reqwest_cookie_store::CookieStoreMutex;
 
-use crate::GenericResult;
+use crate::{GenericResult, data::{Course, CourseVideoMetadata, CourseVideoResource}};
 use crate::data::CourseVideo;
 
 pub async fn tum_live_login(username: &str, password: &str) -> GenericResult<Arc<CookieStoreMutex>> {
@@ -46,9 +46,9 @@ pub async fn detect_tum_live_videos(course_url: &str, tum_live_auth_cookies: Arc
             .and_then(|parent| parent.find(Class("text-5").child(Text)).last())
             .map(|date_time_node| date_time_node.text().trim().to_owned())
             .unwrap_or_default();
-        CourseVideo::TumLiveStream {
-            url: video_url, video_title, date_time_string, lecture_title: lecture_title.clone()
-        }
+        let metadata = CourseVideoMetadata::TumLiveStream {video_title, date_time_string, lecture_title: lecture_title.clone()};
+        let resource = CourseVideoResource::HlsStream {main_m3u8_url: video_url};
+        CourseVideo {metadata, resource}
     }).collect();
 
     Ok(course_videos)
