@@ -4,6 +4,7 @@ pub mod data;
 pub mod moodle;
 pub mod download;
 pub mod tum_live;
+pub mod postprocessing;
 
 /* TODOs
 - parse live.rgb.tum lecture page, extract m3u8 urls

@@ -77,7 +77,8 @@ pub struct Course {
     pub auto_download_mode: AutoDownloadMode,
     pub videos: Vec<CourseFileDownload<CourseVideo>>,
     pub max_keep_days_videos: Option<i32>,
-    pub max_keep_videos: Option<i32>
+    pub max_keep_videos: Option<i32>,
+    pub video_post_processing_steps: Vec<PostprocessingStep>
     /* 
     id
     site url, course name, download directory, re-check interval (seconds), 
@@ -115,4 +116,9 @@ pub struct CourseFileDownload<T> {
     id
     download state (none / requested / running / completed), dowload datetime, file (i.e. the CourseVideo struct), path
     */
+}
+
+#[derive(PartialEq, Serialize, Deserialize)]
+pub enum PostprocessingStep {
+    FfmpegReencode { target_fps: i32 }
 }

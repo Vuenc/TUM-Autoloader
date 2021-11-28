@@ -6,8 +6,9 @@ use tum_autoloader::{GenericError, GenericResult,
     moodle::{moodle_login, detect_moodle_videos},
     tum_live::{tum_live_login, detect_tum_live_videos}};
 use simple_error::simple_error;
-use tum_autoloader::data::{Course, CourseFileDownload, CourseVideo, CourseType, DownloadState, AutoDownloadMode};
+use tum_autoloader::data::{Course, CourseFileDownload, CourseVideo, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
 use serde_json;
+use tum_autoloader::postprocessing::perform_postprocessing_step;
 
 const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
 const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
@@ -36,7 +37,8 @@ async fn main() -> GenericResult<()>{
                 auto_download_mode: AutoDownloadMode::Videos,
                 videos: vec![],
                 max_keep_days_videos: None,
-                max_keep_videos: None
+                max_keep_videos: None,
+                video_post_processing_steps: vec![PostprocessingStep::FfmpegReencode {target_fps: 30}]
             }]
         }
     };
@@ -54,11 +56,13 @@ async fn main() -> GenericResult<()>{
 
         if new_videos_count > 0 {
             let downloads_result = process_downloads(&mut courses, 1).await;
+            let successful_downloads_indices =
             match &downloads_result {
                 Ok(successful_downloads_indices) | Err((successful_downloads_indices, _)) => {
                     println!("Downloaded {} new videos.", successful_downloads_indices.len());
+                    successful_downloads_indices
                 }
-            }
+            };
             if let Err((_, failed_downloads)) = &downloads_result {
                 println!("Failed to download {} videos.", failed_downloads.len());
                 for (course_index, video_index, error) in failed_downloads {
@@ -68,6 +72,8 @@ async fn main() -> GenericResult<()>{
                     println!("{}", error);
                 }
             }
+
+            perform_postprocessing(&courses, &successful_downloads_indices)?;
         }
         save_courses(STATE_FILE_PATH, &courses)?;
     }
@@ -215,4 +221,15 @@ fn load_courses<P>(path: P) -> GenericResult<Vec<Course>>
     let json_courses = String::from_utf8(std::fs::read(path)?)?;
     let courses = serde_json::from_str(&json_courses)?;
     Ok(courses)
+}
+
+fn perform_postprocessing(courses: &Vec<Course>, postprocessing_course_videos_ids: &[(usize, usize)]) -> GenericResult<()> {
+    for &(course_id, video_id) in postprocessing_course_videos_ids {
+        let course = &courses[course_id];
+        let video = &course.videos[video_id];
+        for step in &course.video_post_processing_steps {
+            perform_postprocessing_step(video, step)?;
+        }
+    }
+    Ok(())
 }
