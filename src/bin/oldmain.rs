@@ -9,25 +9,44 @@ use simple_error::simple_error;
 use tum_autoloader::data::{Course, CourseFileDownload, CourseVideo, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
 use serde_json;
 use tum_autoloader::postprocessing::perform_postprocessing_step;
+use structopt::StructOpt;
 
-const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
-const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
+// const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
+// const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
+
+#[derive(StructOpt)]
+#[structopt(name = "tum-autoloader", about = "Automatically download lecture recordings and files from TUM websites.")]
+struct CommandLineOptions {
+    /// Repeatedly check every `repeat_interval` minutes. If not set, run once and exit.
+    #[structopt(long)]
+    repeat_interval: Option<u64>,
+
+    /// JSON file where the program stores its state. Default: "autoloader.json"
+    #[structopt(long, parse(from_os_str), default_value="autoloader.json")]
+    state_file: PathBuf,
+
+    /// .env file where `TUM_USERNAME` and `TUM_PASSWORD` are stored. Default: ".env"
+    #[structopt(long, parse(from_os_str), default_value=".env")]
+    credentials_file: PathBuf
+}
 
 #[tokio::main]
 async fn main() -> GenericResult<()>{
-    // let m3u8_url = "https://stream.lrz.de/vod/_definst_/mp4:tum/RBG/Sem_2021_10_21_12_15COMB.mp4/playlist.m3u8";
-    // let download_future = download_video(m3u8_url, "out.mp4").await;
-    // futures::executor::block_on(download_future).expect("Failed!");
+    let commandline_options = CommandLineOptions::from_args();
 
-    dotenv::dotenv().or(Err(simple_error!("'.env' file with credentials not found.")))?;
+    dotenv::from_path(commandline_options.credentials_file)
+        .or(Err(simple_error!("'.env' file with credentials not found.")))?;
     let username = &std::env::var("TUM_USERNAME")?;
     let password = &std::env::var("TUM_PASSWORD")?;
 
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(RECHECK_INTERVAL_SECONDS));
+    let mut interval = commandline_options.repeat_interval.map(|interval_minutes|
+        tokio::time::interval(tokio::time::Duration::from_secs(interval_minutes * 60)));
 
-    let mut courses = match load_courses(STATE_FILE_PATH) {
+    let mut courses = match load_courses(&commandline_options.state_file) {
         Ok(courses) => courses,
-        Err(_) => {
+        Err(err) => {
+            println!("Error loading state: {:}", err);
+            println!("Using default configuration...");
             vec![ Course {
                 url: "https://www.moodle.tum.de/course/view.php?idnumber=950576833".into(),
                 name: "Programming Languages".into(),
@@ -43,8 +62,11 @@ async fn main() -> GenericResult<()>{
         }
     };
 
-    loop {
-        interval.tick().await;
+    let mut continue_next_check = true;
+    while continue_next_check {
+        if let Some(interval) = &mut interval {
+            interval.tick().await;
+        }
         let new_videos_count = check_for_updates(&mut courses, &username, &password).await?;
 
         println!("{} new videos discovered.", new_videos_count);
@@ -75,8 +97,11 @@ async fn main() -> GenericResult<()>{
 
             perform_postprocessing(&courses, &successful_downloads_indices)?;
         }
-        save_courses(STATE_FILE_PATH, &courses)?;
+        save_courses(&commandline_options.state_file, &courses)?;
+
+        continue_next_check = interval.is_some();
     }
+    Ok(())
 }
 
 async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_password: &str) -> GenericResult<i32> {
