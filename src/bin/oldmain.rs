@@ -1,7 +1,9 @@
-use std::{path::{Path, PathBuf}, pin::Pin};
+use std::{fmt::Display, path::{Path, PathBuf}, pin::Pin};
 
 use futures::{Future, StreamExt, TryFutureExt, stream::{FuturesOrdered}};
-use tum_autoloader::{GenericError, GenericResult, data::CourseVideoResource, download::{download_mp4}, moodle::{moodle_login, detect_moodle_videos}, tum_live::{tum_live_login, detect_tum_live_videos}};
+use tum_autoloader::{GenericError, GenericResult, data::CourseFileResource, download::{download_mp4, download_document},
+    moodle::{MoodleCrawlingError, detect_moodle_files, moodle_login},
+    tum_live::{tum_live_login, detect_tum_live_videos}};
 use simple_error::simple_error;
 use tum_autoloader::data::{Course, CourseFileDownload, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
 use serde_json;
@@ -18,13 +20,17 @@ struct CommandLineOptions {
     #[structopt(long)]
     repeat_interval: Option<u64>,
 
-    /// JSON file where the program stores its state. Default: "autoloader.json"
+    /// JSON file where the program stores its state. Default: "autoloader.json".
     #[structopt(long, parse(from_os_str), default_value="autoloader.json")]
     state_file: PathBuf,
 
-    /// .env file where `TUM_USERNAME` and `TUM_PASSWORD` are stored. Default: ".env"
+    /// .env file where `TUM_USERNAME` and `TUM_PASSWORD` are stored. Default: ".env".
     #[structopt(long, parse(from_os_str), default_value=".env")]
-    credentials_file: PathBuf
+    credentials_file: PathBuf,
+
+    /// In `discover` mode, videos/documents are only discovered, but set to not be automatically downloaded.
+    #[structopt(long)]
+    discover: bool
 }
 
 #[tokio::main]
@@ -51,7 +57,7 @@ async fn main() -> GenericResult<()>{
                 video_download_directory: PathBuf::from("../../Studium/TUM Recordings/"),
                 file_download_directory: PathBuf::from("../../Studium/Programming Languages/"),
                 auto_download_mode: AutoDownloadMode::Videos,
-                videos: vec![],
+                files: vec![],
                 max_keep_days_videos: None,
                 max_keep_videos: None,
                 video_post_processing_steps: vec![PostprocessingStep::FfmpegReencode {target_fps: 30}]
@@ -64,16 +70,30 @@ async fn main() -> GenericResult<()>{
         if let Some(interval) = &mut interval {
             interval.tick().await;
         }
-        let new_videos_count = check_for_updates(&mut courses, &username, &password).await?;
+        let check_for_updates_result = check_for_updates(&mut courses, &username, &password).await;
+        let new_videos_count = match check_for_updates_result {
+            Ok(count) => count,
+            Err(error) => {
+                if error.downcast_ref::<CheckForUpdatesError>().is_some() {
+                    if let Ok(check_for_updates_error) = error.downcast::<CheckForUpdatesError>() {
+                        println!("Errors occured while checking for updates.");
+                        for error in check_for_updates_error.errors {
+                            println!("{}", error);
+                        }
+                        check_for_updates_error.new_videos_count
+                    } else { unreachable!() }
+                } else { return Err(error); }
+        }};
 
         println!("{} new videos discovered.", new_videos_count);
 
-        // let k = courses[0].videos.len() - 0;
-        // for video in courses[0].videos[0..k].iter_mut() {
-        //     video.download_state = DownloadState::None
-        // }
+        if commandline_options.discover {
+            for video in courses[0].files.iter_mut() {
+                video.download_state = DownloadState::None;
+            }
+        }
 
-        if new_videos_count > 0 {
+        if new_videos_count > 0 && !commandline_options.discover {
             let downloads_result = process_downloads(&mut courses, 1).await;
             let successful_downloads_indices =
             match &downloads_result {
@@ -84,9 +104,9 @@ async fn main() -> GenericResult<()>{
             };
             if let Err((_, failed_downloads)) = &downloads_result {
                 println!("Failed to download {} videos.", failed_downloads.len());
-                for (course_index, video_index, error) in failed_downloads {
+                for (course_index, file_index, error) in failed_downloads {
                     let course = &courses[*course_index];
-                    let video = &course.videos[*video_index].file;
+                    let video = &course.files[*file_index].file;
                     println!("Download of {} failed:", video.metadata);
                     println!("{}", error);
                 }
@@ -101,43 +121,62 @@ async fn main() -> GenericResult<()>{
     Ok(())
 }
 
-async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_password: &str) -> GenericResult<i32> {
+#[derive(Debug)]
+pub struct CheckForUpdatesError {
+    pub new_videos_count: u32,
+    pub errors: Vec<GenericError>
+}
+impl Display for CheckForUpdatesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+impl std::error::Error for CheckForUpdatesError {}
+
+async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_password: &str) -> GenericResult<u32> {
     let mut new_videos_count = 0;
     let moodle_auth_cookies = moodle_login(tum_username, tum_password).await?;
+    let mut errors = vec![];
 
     for course in courses {
         match course.course_type {
             CourseType::Moodle => {
-                let mut moodle_videos = detect_moodle_videos(&course.url, moodle_auth_cookies.clone()).await?;
+                let detection_result = detect_moodle_files(&course.url, moodle_auth_cookies.clone()).await;
+                let mut moodle_files = match detection_result {
+                    Ok(files) => files,
+                    Err(error) => {
+                        // First try the downcast then perform it, to not move the error if we have another error type
+                        if error.downcast_ref::<MoodleCrawlingError>().is_some() {
+                            if let Ok(moodle_crawling_error) = error.downcast::<MoodleCrawlingError>() {
+                                errors.extend(moodle_crawling_error.failed_detections);
+                                moodle_crawling_error.successful_detections
+                            } else { unreachable!() }
+                        } else { return Err(error)}
+                }};
 
-                // Deduplicate found videos and update availability information
-                for existing_course_video in &mut course.videos {
-                    if let Some((i, _)) = moodle_videos.iter().enumerate().find(
-                            |(_, v)| **v == existing_course_video.file) {
-                        moodle_videos.remove(i);
+                // Deduplicate found files and update availability information
+                for existing_course_file in &mut course.files {
+                    if let Some((i, _)) = moodle_files.iter().enumerate().find(
+                            |(_, v)| **v == existing_course_file.file) {
+                        moodle_files.remove(i);
                     } else {
-                        existing_course_video.available = false;
+                        existing_course_file.available = false;
                     }
                 }
                 
-                // Add newly found videos to `course.videos`
-                for course_video in moodle_videos {
-                    let video_download_data = CourseFileDownload {
-                        file: course_video,
+                // Add newly found videos to `course.files`
+                for course_file in moodle_files {
+                    let request_download = (course_file.is_video() && course.auto_download_videos_enabled())
+                        || (course_file.is_document() && course.auto_download_documents_enabled());
+                    let file_download_data = CourseFileDownload {
+                        file: course_file,
                         available: true,
-                        download_state: if course.auto_download_videos_enabled() {DownloadState::Requested} else {DownloadState::None},
+                        download_state: if request_download {DownloadState::Requested} else {DownloadState::None},
                         discovery_time: chrono::Utc::now(),
                         download_time: None
                     };
-                    // dbg!(&video_download_data);
-                    // assert!(video_download_data.file.url().ends_with("mp4"));
-                    if let CourseVideoResource::Mp4File {..} = video_download_data.file.resource {
-                        course.videos.push(video_download_data);
-                        new_videos_count += 1;
-                    } else {
-                        println!("Warning - non-mp4 file not supported:");
-                        // println!("{:?}", video_download_data);
-                    }
+                    course.files.push(file_download_data);
+                    new_videos_count += 1;
                 }
                 
             },
@@ -145,11 +184,18 @@ async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_pa
             CourseType::GenericWebsite => todo!(),
         }
     }
-    Ok(new_videos_count)
+    if errors.len() == 0 {
+        Ok(new_videos_count)
+    } else {
+        Err(CheckForUpdatesError { new_videos_count, errors }.into())
+    }
 }
 
+type ProcessDownloadsResult = Result<Vec<(usize, usize)>, 
+    (Vec<(usize, usize)>, Vec<(usize, usize, GenericError)>)>;
+
 async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: usize)
-        -> Result<Vec<(usize, usize)>, (Vec<(usize, usize)>, Vec<(usize, usize, GenericError)>)> {
+        -> ProcessDownloadsResult {
     let mut download_futures = FuturesOrdered::new();
 
     // Store course and video indices of all, successful and failed downloads
@@ -159,34 +205,45 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
 
     // Iterating over all videos of all courses
     for (i, course) in courses.iter_mut().enumerate() {
-        for (j, video) in course.videos.iter_mut().enumerate() {
+        for (j, file) in course.files.iter_mut().enumerate() {
 
             // If the video is requested to be downloaded:
-            if video.download_state == DownloadState::Requested {
+            if file.download_state == DownloadState::Requested {
                 // Mark download as attempted, construct a download future depending on the video type.
                 attempted_downloads_indices.push((i, j));
                 let download_future: Pin<Box<dyn Future<Output = GenericResult<()>>>> =
-                match &video.file.resource {
-                    CourseVideoResource::Mp4File { url, .. } => {
-                        // For moodle videos: identify target filename from url
+                match &file.file.resource {
+                    CourseFileResource::Mp4File { url, .. } => {
+                        // For mp4 files: identify target filename from url
                         match url.split("/").last() {
                             Some(filename) => {
                                 let path = course.video_download_directory.join(filename.to_owned());
                                 // Set download state to running and build the download future
-                                video.download_state = DownloadState::Running(path.clone());
+                                file.download_state = DownloadState::Running(path.clone());
                                 Box::pin(reqwest::get(url)
                                     .err_into::<GenericError>()
                                     .and_then(move |response| download_mp4(response, path)))
                             }
-                            None => {
                                 // If no filename can be identified: add future indicating this failure
-                                Box::pin(async { Err(simple_error!("URL has no '/'").into()) })
-                                // unsuccessful_downloads_indices.push((i, j, simple_error!("URL has no '/'").into()));
-                                // continue 'video_loop
-                            }
+                            None => { Box::pin(async { Err(simple_error!("URL has no '/'").into()) }) }
                         }
                     },
-                    CourseVideoResource::HlsStream { main_m3u8_url } => todo!(),
+                    CourseFileResource::HlsStream { .. } => todo!(),
+                    CourseFileResource::Document { url, .. } => {                        
+                        // For documents: identify target filename from url
+                        match url.split("/").last() {
+                            Some(filename) => {
+                                let path = course.file_download_directory.join(filename.to_owned());
+                                // Set download state to running and build the download future
+                                file.download_state = DownloadState::Running(path.clone());
+                                Box::pin(reqwest::get(url)
+                                    .err_into::<GenericError>()
+                                    .and_then(move |response| download_document(response, path)))
+                            }
+                                // If no filename can be identified: add future indicating this failure
+                            None => { Box::pin(async { Err(simple_error!("URL has no '/'").into()) }) }
+                        }
+                    }
                 };
                 // Push download future into running queue
                 download_futures.push(download_future);
@@ -210,19 +267,19 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
     let mut successful_downloads_indices = vec![];
     let mut unsuccessful_downloads_indices = vec![];
     // For each result and corresponding course/video index:
-    for (&(course_index, video_index), result) in attempted_downloads_indices.iter().zip(download_results) {
+    for (&(course_index, file_index), result) in attempted_downloads_indices.iter().zip(download_results) {
         match result {
             Ok(_) => {
                 // If the download was successful: set state to `Completed`
-                if let DownloadState::Running(ref path) = courses[course_index].videos[video_index].download_state {
-                    courses[course_index].videos[video_index].download_state = DownloadState::Completed(path.clone());
-                    courses[course_index].videos[video_index].download_time = Some(chrono::Utc::now());
-                    successful_downloads_indices.push((course_index, video_index))
+                if let DownloadState::Running(ref path) = courses[course_index].files[file_index].download_state {
+                    courses[course_index].files[file_index].download_state = DownloadState::Completed(path.clone());
+                    courses[course_index].files[file_index].download_time = Some(chrono::Utc::now());
+                    successful_downloads_indices.push((course_index, file_index))
                 }
             },
             Err(error) => {
-                courses[course_index].videos[video_index].download_state = DownloadState::Failed;
-                unsuccessful_downloads_indices.push((course_index, video_index, error))
+                courses[course_index].files[file_index].download_state = DownloadState::Failed;
+                unsuccessful_downloads_indices.push((course_index, file_index, error))
             }
         }
     }
@@ -253,7 +310,7 @@ fn load_courses<P>(path: P) -> GenericResult<Vec<Course>>
 fn perform_postprocessing(courses: &Vec<Course>, postprocessing_course_videos_ids: &[(usize, usize)]) -> GenericResult<()> {
     for &(course_id, video_id) in postprocessing_course_videos_ids {
         let course = &courses[course_id];
-        let video = &course.videos[video_id];
+        let video = &course.files[video_id];
         for step in &course.video_post_processing_steps {
             perform_postprocessing_step(video, step)?;
         }

@@ -1,5 +1,5 @@
-use reqwest;
-use std::sync::Arc;
+use reqwest::{self, Url};
+use std::{fmt::Display, sync::Arc};
 use regex::Regex;
 use futures::{self, TryFutureExt, stream::{StreamExt, FuturesOrdered}};
 use select::{document::Document,
@@ -7,15 +7,30 @@ use select::{document::Document,
 use simple_error::simple_error;
 use reqwest_cookie_store::CookieStoreMutex;
 
-use crate::{GenericError, GenericResult, data::{CourseVideoMetadata, CourseVideoResource}};
-use crate::data::CourseVideo;
+use crate::{GenericError, GenericResult, data::{CourseFileMetadata, CourseFileResource, CourseFile}};
 
-pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseVideo>> {
+#[derive(Debug)]
+pub struct MoodleCrawlingError {
+    pub successful_detections: Vec<CourseFile>,
+    pub failed_detections: Vec<GenericError>
+}
+
+impl Display for MoodleCrawlingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::error::Error for MoodleCrawlingError {}
+
+pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>) 
+        -> GenericResult<Vec<CourseFile>>
+{
     let client = reqwest::Client::builder()
         .cookie_provider(moodle_auth_cookies.clone())
         .build()?;
         
-    // Define before download_futures s.t. it is not dropped and referencing the Regex from a closure succeeds
+    // Define before `download_futures` s.t. it is not dropped too early and referencing the Regex from a closure succeeds
     let panopto_video_url_regex = Regex::new(r#""VideoUrl":"(.*?)""#)?;
     let mut detect_futures: FuturesOrdered<futures::future::BoxFuture<_>> = FuturesOrdered::new();
     
@@ -28,29 +43,29 @@ pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<Coo
         for section_node in course_page_dom.find(Class("section").and(Class("main"))) {
             let section_title = section_node.find(Class("sectionname")).next().map_or(String::default(), |n| n.text());
 
-            // Iterate through nodes that could be videos
-            for video_node in section_node.find(
-                    Class("activityinstance") // Match videos that are directly linked as activity
-                    .or(Name("iframe").and(Attr("src", ())))) // Match embedded Panoptop players
-                {
+            // Iterate through nodes that could be directly linked videos/documents
+            for activity_node in section_node.find(Class("activityinstance"))
+            {
                 let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
-
-                // Video that is directly linked as mp4
-                if let Some("activityinstance") = video_node.attr("class") {
-                    let activity_url = video_node.find(Name("a")).next().unwrap().attr("href").unwrap();
-                    let video_title = video_node.find(Class("instancename")).next().unwrap().text(); //.map(|x| x.text())
-                    let detect_video_future = client.get(activity_url)
-                        .send().err_into::<GenericError>()
-                        .map_ok(|resp| {
-                            let url = resp.url().to_string();
-                            moodle_course_video(url, lecture_title, section_title, video_title)
-                        });
-                    detect_futures.push(Box::pin(detect_video_future));
-                }
+                let activity_url = activity_node.find(Name("a")).next().unwrap().attr("href").unwrap();
+                let activity_title = activity_node.find(Class("instancename")).next().unwrap().text(); //.map(|x| x.text())
+                // TODO: Handle nested activity urls recursively
+                let detect_file_future = client.get(activity_url)
+                    .send().err_into::<GenericError>()
+                    .map_ok(|resp| {
+                        let url = resp.url().to_string();
+                        moodle_course_file(url, lecture_title, section_title, activity_title)
+                    });
+                detect_futures.push(Box::pin(detect_file_future));
+            }
+            // Iterate through nodes that could be embedded Panopto players
+            for video_node in section_node.find(Name("iframe").and(Attr("src", ())))
+            {
                 // Video in embedded Panopto player
-                else if video_node.name() == Some("iframe") && video_node.attr("src").unwrap().contains("panopto") {
+                if video_node.name() == Some("iframe") && video_node.attr("src").unwrap().contains("panopto") {
                     // Recieve embedded player HTML and extract video url and title from it
                     let panopto_url = video_node.attr("src").unwrap();
+                    let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
                     let detect_video_future = client.get(panopto_url).send().err_into::<GenericError>()
                         .and_then(|resp| resp.text().err_into::<GenericError>())
                         .map_ok(|text| {
@@ -68,7 +83,7 @@ pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<Coo
                                 .and_then(move |url_match| {
                                     // In the JavaScript code, / is escaped as \/
                                     let video_url = url_match.as_str().replace("\\/", "/");
-                                    moodle_course_video(video_url, lecture_title, section_title, video_title)
+                                    moodle_course_file(video_url, lecture_title, section_title, video_title)
                                 })
                         });
                     detect_futures.push(Box::pin(detect_video_future));
@@ -77,28 +92,48 @@ pub async fn detect_moodle_videos(course_url: &str, moodle_auth_cookies: Arc<Coo
         }
     }
 
-    let mut course_videos = vec![];
+    let mut course_files = vec![];
+    let mut errors: Vec<GenericError> = vec![];
     while let Some(result) = detect_futures.next().await {
         match result {
             Ok(Some(course_video)) => {
-                course_videos.push(course_video);
+                course_files.push(course_video);
             },
-            Ok(None) => {} // Ignore (e.g. pdf instead of mp4 files)
-            error@Err(_) => { error?; } // Like this for now, but just skipping would also be an option
+            Ok(None) => {} // Ignore (e.g. unwanted file types)
+            Err(error) => { errors.push(error.into()); } // Like this for now, but just skipping would also be an option
         }
     }
-    
-    Ok(course_videos)
+    if errors.len() == 0 {
+        Ok(course_files)
+    } else {
+        Err(MoodleCrawlingError{successful_detections: course_files, failed_detections: errors}.into())
+    }
 }
 
-fn moodle_course_video(url: String, lecture_title: String, section_title: String, video_title: String) -> Option<CourseVideo> {
-    let metadata = CourseVideoMetadata::MoodleVideo { lecture_title, section_title, video_title };
-    let resource = if url.ends_with("mp4") { 
-        Some(CourseVideoResource::Mp4File {url}) 
-    } else if url.ends_with("m3u8") {
-        Some(CourseVideoResource::HlsStream {main_m3u8_url: url})
-    } else { None };
-    resource.map(|resource| CourseVideo { metadata, resource })
+fn moodle_course_file(url: String, lecture_title: String, section_title: String, activity_title: String) -> Option<CourseFile> {
+    let metadata = CourseFileMetadata::MoodleActivity { lecture_title, section_title, activity_title };
+    let url_parsed = Url::parse(&url);
+    let file_extension = url_parsed.ok()
+        .and_then(|url_parsed| url_parsed.path_segments()
+        .and_then(|p| p.into_iter().last())
+        .map(|s| s.rfind(".")
+        .map(|i| (&s[i..]).to_lowercase())));
+
+    let resource = match file_extension {
+        Some(Some(extension)) => {
+            match extension.as_str() {
+                "mp4" => Some(CourseFileResource::Mp4File {url}),
+                "m3u8" => Some(CourseFileResource::HlsStream {main_m3u8_url: url}),
+                "html" => None, // HTML files are ignored
+                _ => Some(CourseFileResource::Document {url, file_extension: Some(extension)})
+            }
+        }
+        // Some(None) means: URL parsing worked, but there is not . indicating a file extension
+        Some(None) => Some(CourseFileResource::Document {url, file_extension: None}),
+        // None means: URL parsing failed
+        None => None
+    };
+    resource.map(|resource| CourseFile { metadata, resource })
 }
 
 fn extract_html_input_value<'a>(document: &'a Document, input_name: &str) -> GenericResult<&'a str> {

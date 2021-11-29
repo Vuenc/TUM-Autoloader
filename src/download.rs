@@ -7,13 +7,15 @@ use futures::{self, TryFutureExt, stream::{FuturesUnordered, StreamExt}};
 use crate::GenericResult;
 
 pub async fn download_mp4(resp: reqwest::Response, path: PathBuf) -> GenericResult<()> {
-    // let resp = resp?; Result<reqwest::Response, reqwest::Error>
-    // let filename = resp.url().to_string().split("/").last().ok_or(simple_error!("URL has no '/'"))?.to_owned();
-    // dbg!(&filename);
-    // if !filename.ends_with("mp4") {
-    //     return Ok(())
-    // }
-    // let path = Path::new("../../Studium/TUM Recordings/").join(filename);
+    let mut writer = BufWriter::new(File::create(path)?);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        writer.write(&chunk?)?;
+    }
+    Ok(())
+}
+
+pub async fn download_document(resp: reqwest::Response, path: PathBuf) -> GenericResult<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {

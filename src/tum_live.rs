@@ -4,8 +4,7 @@ use select::{document::Document, predicate::{Predicate, Attr, Class, Name, Text}
 use simple_error::simple_error;
 use reqwest_cookie_store::CookieStoreMutex;
 
-use crate::{GenericResult, data::{Course, CourseVideoMetadata, CourseVideoResource}};
-use crate::data::CourseVideo;
+use crate::{GenericResult, data::{CourseFile, CourseFileMetadata, CourseFileResource}};
 
 pub async fn tum_live_login(username: &str, password: &str) -> GenericResult<Arc<CookieStoreMutex>> {
     // Login needs to store cookies, so our client needs a cookie store
@@ -27,7 +26,7 @@ pub async fn tum_live_login(username: &str, password: &str) -> GenericResult<Arc
     }
 }
 
-pub async fn detect_tum_live_videos(course_url: &str, tum_live_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseVideo>> {
+pub async fn detect_tum_live_videos(course_url: &str, tum_live_auth_cookies: Arc<CookieStoreMutex>) -> GenericResult<Vec<CourseFile>> {
     let client = reqwest::Client::builder()
         .cookie_provider(tum_live_auth_cookies.clone())
         .build()?;
@@ -46,9 +45,9 @@ pub async fn detect_tum_live_videos(course_url: &str, tum_live_auth_cookies: Arc
             .and_then(|parent| parent.find(Class("text-5").child(Text)).last())
             .map(|date_time_node| date_time_node.text().trim().to_owned())
             .unwrap_or_default();
-        let metadata = CourseVideoMetadata::TumLiveStream {video_title, date_time_string, lecture_title: lecture_title.clone()};
-        let resource = CourseVideoResource::HlsStream {main_m3u8_url: video_url};
-        CourseVideo {metadata, resource}
+        let metadata = CourseFileMetadata::TumLiveStream {video_title, date_time_string, lecture_title: lecture_title.clone()};
+        let resource = CourseFileResource::HlsStream {main_m3u8_url: video_url};
+        CourseFile {metadata, resource}
     }).collect();
 
     Ok(course_videos)

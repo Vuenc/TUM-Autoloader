@@ -1,98 +1,81 @@
 use std::{fmt::Display, path::{PathBuf}};
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize)]
-pub enum CourseVideoMetadata {
+#[derive(Serialize, Deserialize, Debug)]
+pub enum CourseFileMetadata {
     TumLiveStream {
         lecture_title: String,
         video_title: String,
         date_time_string: String
     },
-    MoodleVideo {
+    MoodleActivity {
         lecture_title: String,
         section_title: String,
-        video_title: String
+        activity_title: String
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum CourseDocumentMetadata {
-    MoodleDocument {
-        lecture_title: String,
-        section_title: String,
-        video_title: String
-    }
-}
-
-#[derive(Serialize, Deserialize, PartialEq)]
-pub enum CourseVideoResource {
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+pub enum CourseFileResource {
     Mp4File {
         url: String
     },
     HlsStream {
         main_m3u8_url: String
+    },
+    Document {
+        url: String,
+        file_extension: Option<String>
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
-pub struct CourseDocumentResource {
-    pub url: String,
-    pub filetype: String
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CourseFile {
+    pub resource: CourseFileResource,
+    pub metadata: CourseFileMetadata
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct CourseVideo {
-    pub resource: CourseVideoResource,
-    pub metadata: CourseVideoMetadata
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct CourseDocument {
-    pub resource: CourseDocumentResource,
-    pub metadata: CourseVideoMetadata
-}
-
-impl Display for CourseVideoMetadata {
+impl Display for CourseFileMetadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CourseVideoMetadata::TumLiveStream { lecture_title, video_title, .. }
-            | CourseVideoMetadata::MoodleVideo { lecture_title, video_title, .. }  => {
-                write!(f, "{} - {}", lecture_title, video_title)
+            CourseFileMetadata::TumLiveStream { lecture_title, video_title: title, .. }
+            | CourseFileMetadata::MoodleActivity { lecture_title, activity_title: title, .. }  => {
+                write!(f, "{} - {}", lecture_title, title)
             }
         }
     }
 }
 
+impl CourseFile {
+    pub fn is_video(&self) -> bool {
+        match self.resource {
+            CourseFileResource::Mp4File { .. } |
+            CourseFileResource::HlsStream { .. } => true,
+            CourseFileResource::Document { .. } => false
+        }
+    }
+
+    pub fn is_document(&self) -> bool {
+        match self.resource {
+            CourseFileResource::Mp4File { .. } |
+            CourseFileResource::HlsStream { .. } => false,
+            CourseFileResource::Document { .. } => true
+        }
+    }
+}
+
 /// For now: Two videos are considered equal if they point to the same resource, ignoring the metadata
-impl PartialEq for CourseVideo {
+impl PartialEq for CourseFile {
     fn eq(&self, other: &Self) -> bool {
         self.resource == other.resource
     }
 }
 
-// impl CourseVideo {
-//     pub fn url(&self) -> &str {
-//         match self {
-//             CourseVideo::TumLiveStream { url, ..} => url,
-//             CourseVideo::MoodleVideoFile { url, ..} => url,
-//             CourseVideo::PanoptoVideoFile { url, ..} => url,
-//         }
-//     }
-
-//     pub fn video_title(&self) -> &str {
-//         match self {
-//             CourseVideo::TumLiveStream { video_title, ..} => video_title,
-//             CourseVideo::MoodleVideoFile { video_title, ..} => video_title,
-//             CourseVideo::PanoptoVideoFile { video_title, ..} => video_title,
-//         }
-//     }
-// }
-
 #[derive(PartialEq, Serialize, Deserialize)]
 pub enum AutoDownloadMode {
     None,
     Videos,
-    Files,
+    Documents,
     All,
 }
 
@@ -122,7 +105,7 @@ pub struct Course {
     pub video_download_directory: PathBuf,
     pub file_download_directory: PathBuf,
     pub auto_download_mode: AutoDownloadMode,
-    pub videos: Vec<CourseFileDownload<CourseVideo>>,
+    pub files: Vec<CourseFileDownload<CourseFile>>,
     pub max_keep_days_videos: Option<i32>,
     pub max_keep_videos: Option<i32>,
     pub video_post_processing_steps: Vec<PostprocessingStep>
@@ -143,9 +126,9 @@ impl Course {
         }
     }
 
-    pub fn auto_download_files_enabled(&self) -> bool {
+    pub fn auto_download_documents_enabled(&self) -> bool {
         match self.auto_download_mode {
-            AutoDownloadMode::Files | AutoDownloadMode::All => true,
+            AutoDownloadMode::Documents | AutoDownloadMode::All => true,
             _ => false
         }
     }
@@ -167,5 +150,5 @@ pub struct CourseFileDownload<T> {
 
 #[derive(PartialEq, Serialize, Deserialize)]
 pub enum PostprocessingStep {
-    FfmpegReencode { target_fps: i32 }
+    FfmpegReencode { target_fps: u32 }
 }
