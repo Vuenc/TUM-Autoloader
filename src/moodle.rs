@@ -37,26 +37,30 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
     let resp = client.get(course_url).send().await?;
     { // Artificial scope s.t. the non-`Send` `course_page_dom` is dropped before the next .await
         let course_page_dom = Document::from(resp.text().await?.as_str());
-        let lecture_title = course_page_dom.find(Class("page-header-headings")).next().unwrap().text();
+        let lecture_title = course_page_dom.find(Class("page-header-headings")).next().map(|n| n.text()).unwrap_or_default();
 
         // Iterate through main sections to capture their titles
         for section_node in course_page_dom.find(Class("section").and(Class("main"))) {
-            let section_title = section_node.find(Class("sectionname")).next().map_or(String::default(), |n| n.text());
-
+            let section_title = section_node.find(Class("sectionname")).next().map(|n| n.text()).unwrap_or_default();
+           
             // Iterate through nodes that could be directly linked videos/documents
             for activity_node in section_node.find(Class("activityinstance"))
             {
+                // dbg!(&activity_node);
                 let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
-                let activity_url = activity_node.find(Name("a")).next().unwrap().attr("href").unwrap();
-                let activity_title = activity_node.find(Class("instancename")).next().unwrap().text(); //.map(|x| x.text())
-                // TODO: Handle nested activity urls recursively
-                let detect_file_future = client.get(activity_url)
-                    .send().err_into::<GenericError>()
-                    .map_ok(|resp| {
-                        let url = resp.url().to_string();
-                        moodle_course_file(url, lecture_title, section_title, activity_title)
-                    });
-                detect_futures.push(Box::pin(detect_file_future));
+                if let Some(activity_url) = activity_node.find(Name("a")).next()
+                    .and_then(|n| n.attr("href")) 
+                {
+                    let activity_title = activity_node.find(Class("instancename")).next().map(|n| n.text()).unwrap_or_default();
+                    // TODO: Handle nested activity urls recursively
+                    let detect_file_future = client.get(activity_url)
+                        .send().err_into::<GenericError>()
+                        .map_ok(|resp| {
+                            let url = resp.url().to_string();
+                            moodle_course_file(url, lecture_title, section_title, activity_title)
+                        });
+                    detect_futures.push(Box::pin(detect_file_future));
+                }
             }
             // Iterate through nodes that could be embedded Panopto players
             for video_node in section_node.find(Name("iframe").and(Attr("src", ())))
@@ -117,19 +121,19 @@ fn moodle_course_file(url: String, lecture_title: String, section_title: String,
         .and_then(|url_parsed| url_parsed.path_segments()
         .and_then(|p| p.into_iter().last())
         .map(|s| s.rfind(".")
-        .map(|i| (&s[i..]).to_lowercase())));
+        .map(|i| (&s[i+1..]).to_lowercase())));
 
     let resource = match file_extension {
         Some(Some(extension)) => {
             match extension.as_str() {
                 "mp4" => Some(CourseFileResource::Mp4File {url}),
                 "m3u8" => Some(CourseFileResource::HlsStream {main_m3u8_url: url}),
-                "html" => None, // HTML files are ignored
+                "html" | "php" => None, // HTML and PHP files are ignored
                 _ => Some(CourseFileResource::Document {url, file_extension: Some(extension)})
             }
         }
-        // Some(None) means: URL parsing worked, but there is not . indicating a file extension
-        Some(None) => Some(CourseFileResource::Document {url, file_extension: None}),
+        // Some(None) means: URL parsing worked, but there is not . indicating a file extension. For now: ignore such files.
+        Some(None) => None, // alternatively: Some(CourseFileResource::Document {url, file_extension: None}),
         // None means: URL parsing failed
         None => None
     };

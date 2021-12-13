@@ -14,10 +14,10 @@ pub fn perform_postprocessing_step(video: &CourseFileDownload<CourseFile>, step:
 }
 
 fn ffmpeg_reencode(video: &CourseFileDownload<CourseFile>, target_fps: u32) -> GenericResult<()> {
-    let input_path = if let DownloadState::Completed(path) = &video.download_state {
+    let input_path = if let DownloadState::PostprocessingPending(path) = &video.download_state {
         path
     } else {
-        return Err(simple_error!("Could not postprocess: Video download is not completed.").into());
+        return Err(simple_error!("Could not postprocess: Video not in PostprocessingPending state.").into());
     };
     let input_path_str = input_path.to_str().ok_or(simple_error!("Could not postprocess: Non-UTF8 path not supported."))?;
     let output_dir = tempfile::tempdir()?;

@@ -1,4 +1,4 @@
-use std::{fmt::Display, path::{Path, PathBuf}, pin::Pin};
+use std::{fmt::Display, path::{Path, PathBuf}, pin::Pin, sync::Arc};
 
 use futures::{Future, StreamExt, TryFutureExt, stream::{FuturesOrdered}};
 use tum_autoloader::{GenericError, GenericResult, data::CourseFileResource, download::{download_mp4, download_document},
@@ -9,6 +9,7 @@ use tum_autoloader::data::{Course, CourseFileDownload, CourseType, DownloadState
 use serde_json;
 use tum_autoloader::postprocessing::perform_postprocessing_step;
 use structopt::StructOpt;
+use urlencoding;
 
 // const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
 // const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
@@ -70,8 +71,10 @@ async fn main() -> GenericResult<()>{
         if let Some(interval) = &mut interval {
             interval.tick().await;
         }
-        let check_for_updates_result = check_for_updates(&mut courses, &username, &password).await;
-        let new_videos_count = match check_for_updates_result {
+        let moodle_auth_cookies = moodle_login(&username, &password).await?;
+
+        let check_for_updates_result = check_for_updates(&mut courses, moodle_auth_cookies.clone()).await;
+        let (new_videos_count, new_documents_count) = match check_for_updates_result {
             Ok(count) => count,
             Err(error) => {
                 if error.downcast_ref::<CheckForUpdatesError>().is_some() {
@@ -80,12 +83,12 @@ async fn main() -> GenericResult<()>{
                         for error in check_for_updates_error.errors {
                             println!("{}", error);
                         }
-                        check_for_updates_error.new_videos_count
+                        (check_for_updates_error.new_videos_count, check_for_updates_error.new_documents_count)
                     } else { unreachable!() }
                 } else { return Err(error); }
         }};
 
-        println!("{} new videos discovered.", new_videos_count);
+        println!("{} new videos and {} new documents discovered.", new_videos_count, new_documents_count);
 
         if commandline_options.discover {
             for video in courses[0].files.iter_mut() {
@@ -93,26 +96,48 @@ async fn main() -> GenericResult<()>{
             }
         }
 
-        if new_videos_count > 0 && !commandline_options.discover {
-            let downloads_result = process_downloads(&mut courses, 1).await;
-            let successful_downloads_indices =
-            match &downloads_result {
-                Ok(successful_downloads_indices) | Err((successful_downloads_indices, _)) => {
-                    println!("Downloaded {} new videos.", successful_downloads_indices.len());
-                    successful_downloads_indices
+        if new_videos_count + new_documents_count > 0 && !commandline_options.discover {
+            let downloads_result = process_downloads(&mut courses, 1, moodle_auth_cookies.clone()).await;
+
+            // let (new_videos_count, new_documents_count) = match check_for_updates_result {
+            //     Ok(count) => count,
+            //     Err(error) => {
+            //         if error.downcast_ref::<CheckForUpdatesError>().is_some() {
+            //             if let Ok(check_for_updates_error) = error.downcast::<CheckForUpdatesError>() {
+            //                 println!("Errors occured while checking for updates.");
+            //                 for error in check_for_updates_error.errors {
+            //                     println!("{}", error);
+            //                 }
+            //                 (check_for_updates_error.new_videos_count, check_for_updates_error.new_documents_count)
+            //             } else { unreachable!() }
+            //         } else { return Err(error); }
+            // }};
+
+            let (successful_downloads_indices, failed_downloads) = match downloads_result {
+                Ok(successful_downloads_indices) => (successful_downloads_indices, vec![]),
+                Err(error) => {
+                    if error.downcast_ref::<ProcessDownloadsError>().is_some() {
+                        if let Ok(process_downloads_error) = error.downcast::<ProcessDownloadsError>() {
+                            (process_downloads_error.successful_downloads_indices, process_downloads_error.unsuccessful_downloads_indices)
+                        } else { unreachable!() }
+                    } else { return Err(error); }
                 }
             };
-            if let Err((_, failed_downloads)) = &downloads_result {
+            println!("Downloaded {} new videos.", successful_downloads_indices.len());
+            if failed_downloads.len() > 0 {
                 println!("Failed to download {} videos.", failed_downloads.len());
                 for (course_index, file_index, error) in failed_downloads {
-                    let course = &courses[*course_index];
-                    let video = &course.files[*file_index].file;
+                    let course = &courses[course_index];
+                    let video = &course.files[file_index].file;
                     println!("Download of {} failed:", video.metadata);
                     println!("{}", error);
                 }
             }
 
-            perform_postprocessing(&courses, &successful_downloads_indices)?;
+            let state_file_path = commandline_options.state_file.clone();
+            save_courses(&commandline_options.state_file, &courses)?;
+            perform_postprocessing(&mut courses, 
+                |updated_courses| save_courses(&state_file_path, updated_courses))?;
         }
         save_courses(&commandline_options.state_file, &courses)?;
 
@@ -124,6 +149,7 @@ async fn main() -> GenericResult<()>{
 #[derive(Debug)]
 pub struct CheckForUpdatesError {
     pub new_videos_count: u32,
+    pub new_documents_count: u32,
     pub errors: Vec<GenericError>
 }
 impl Display for CheckForUpdatesError {
@@ -133,9 +159,10 @@ impl Display for CheckForUpdatesError {
 }
 impl std::error::Error for CheckForUpdatesError {}
 
-async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_password: &str) -> GenericResult<u32> {
+async fn check_for_updates(courses: &mut Vec<Course>,
+        moodle_auth_cookies: Arc<reqwest_cookie_store::CookieStoreMutex>) -> GenericResult<(u32, u32)> {
     let mut new_videos_count = 0;
-    let moodle_auth_cookies = moodle_login(tum_username, tum_password).await?;
+    let mut new_documents_count = 0;
     let mut errors = vec![];
 
     for course in courses {
@@ -168,6 +195,9 @@ async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_pa
                 for course_file in moodle_files {
                     let request_download = (course_file.is_video() && course.auto_download_videos_enabled())
                         || (course_file.is_document() && course.auto_download_documents_enabled());
+                    if course_file.is_document() { new_documents_count  += 1; }
+                    else if course_file.is_video() { new_videos_count += 1; }
+
                     let file_download_data = CourseFileDownload {
                         file: course_file,
                         available: true,
@@ -176,7 +206,6 @@ async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_pa
                         download_time: None
                     };
                     course.files.push(file_download_data);
-                    new_videos_count += 1;
                 }
                 
             },
@@ -185,18 +214,31 @@ async fn check_for_updates(courses: &mut Vec<Course>, tum_username: &str, tum_pa
         }
     }
     if errors.len() == 0 {
-        Ok(new_videos_count)
+        Ok((new_videos_count, new_documents_count))
     } else {
-        Err(CheckForUpdatesError { new_videos_count, errors }.into())
+        Err(CheckForUpdatesError { new_videos_count, new_documents_count, errors }.into())
     }
 }
 
-type ProcessDownloadsResult = Result<Vec<(usize, usize)>, 
-    (Vec<(usize, usize)>, Vec<(usize, usize, GenericError)>)>;
+#[derive(Debug)]
+pub struct ProcessDownloadsError {
+    pub successful_downloads_indices: Vec<(usize, usize)>,
+    pub unsuccessful_downloads_indices: Vec<(usize, usize, GenericError)>
+}
+impl Display for ProcessDownloadsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+impl std::error::Error for ProcessDownloadsError {}
 
-async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: usize)
-        -> ProcessDownloadsResult {
+async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: usize, 
+        moodle_auth_cookies: Arc<reqwest_cookie_store::CookieStoreMutex>) -> GenericResult<Vec<(usize, usize)>> {
     let mut download_futures = FuturesOrdered::new();
+
+    let client = reqwest::Client::builder()
+        .cookie_provider(moodle_auth_cookies.clone())
+        .build()?;
 
     // Store course and video indices of all, successful and failed downloads
     // s.t. after the loop, when the mutable borrow of courses has ended, the download states can be updated.
@@ -217,10 +259,11 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
                         // For mp4 files: identify target filename from url
                         match url.split("/").last() {
                             Some(filename) => {
-                                let path = course.video_download_directory.join(filename.to_owned());
+                                let decoded_filename = urlencoding::decode(filename).unwrap().to_string();
+                                let path = course.video_download_directory.join(decoded_filename);
                                 // Set download state to running and build the download future
                                 file.download_state = DownloadState::Running(path.clone());
-                                Box::pin(reqwest::get(url)
+                                Box::pin(client.get(url).send()
                                     .err_into::<GenericError>()
                                     .and_then(move |response| download_mp4(response, path)))
                             }
@@ -233,10 +276,11 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
                         // For documents: identify target filename from url
                         match url.split("/").last() {
                             Some(filename) => {
-                                let path = course.file_download_directory.join(filename.to_owned());
+                                let decoded_filename = urlencoding::decode(filename).unwrap().to_string();
+                                let path = course.file_download_directory.join(decoded_filename);
                                 // Set download state to running and build the download future
                                 file.download_state = DownloadState::Running(path.clone());
-                                Box::pin(reqwest::get(url)
+                                Box::pin(client.get(url).send()
                                     .err_into::<GenericError>()
                                     .and_then(move |response| download_document(response, path)))
                             }
@@ -270,9 +314,14 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
     for (&(course_index, file_index), result) in attempted_downloads_indices.iter().zip(download_results) {
         match result {
             Ok(_) => {
+                let course = &mut courses[course_index];
+                let file = &mut course.files[file_index];
                 // If the download was successful: set state to `Completed`
-                if let DownloadState::Running(ref path) = courses[course_index].files[file_index].download_state {
-                    courses[course_index].files[file_index].download_state = DownloadState::Completed(path.clone());
+                if let DownloadState::Running(ref path) = file.download_state {
+                    let needs_postprocessing = !course.video_post_processing_steps.is_empty() && file.file.is_video();
+                    let new_state = if needs_postprocessing { DownloadState::PostprocessingPending } 
+                        else { DownloadState::Completed }(path.clone());
+                    courses[course_index].files[file_index].download_state = new_state;
                     courses[course_index].files[file_index].download_time = Some(chrono::Utc::now());
                     successful_downloads_indices.push((course_index, file_index))
                 }
@@ -288,7 +337,7 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
         return Ok(successful_downloads_indices)
     } else {
         // Return an error with the list of failed downloads if there are any
-        return Err((successful_downloads_indices, unsuccessful_downloads_indices))
+        return Err(ProcessDownloadsError { successful_downloads_indices, unsuccessful_downloads_indices }.into())
     }
 }
 
@@ -307,12 +356,24 @@ fn load_courses<P>(path: P) -> GenericResult<Vec<Course>>
     Ok(courses)
 }
 
-fn perform_postprocessing(courses: &Vec<Course>, postprocessing_course_videos_ids: &[(usize, usize)]) -> GenericResult<()> {
-    for &(course_id, video_id) in postprocessing_course_videos_ids {
-        let course = &courses[course_id];
-        let video = &course.files[video_id];
-        for step in &course.video_post_processing_steps {
-            perform_postprocessing_step(video, step)?;
+fn perform_postprocessing<F>(courses: &mut Vec<Course>,
+    progress_closure: F) -> GenericResult<()> 
+    where F: Fn(&Vec<Course>) -> GenericResult<()>
+{
+    for i in 0..courses.len() {
+        for j in 0..courses[i].files.len() {
+            let course = &mut courses[i];
+            let file = &mut course.files[j];
+            // TODO: check that video_post_processing_steps.is_empty() 
+            if let DownloadState::PostprocessingPending(ref path) = file.download_state {
+                if file.file.is_video() {
+                    for step in &course.video_post_processing_steps {
+                        perform_postprocessing_step(file, step)?;
+                    }
+                    file.download_state = DownloadState::Completed(path.clone());
+                    progress_closure(courses)?;
+                }
+            }
         }
     }
     Ok(())

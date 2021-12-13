@@ -85,6 +85,7 @@ pub enum DownloadState {
     None,
     Requested,
     Running(PathBuf),
+    PostprocessingPending(PathBuf),
     Completed(PathBuf),
     Failed
 }
@@ -148,7 +149,7 @@ pub struct CourseFileDownload<T> {
     */
 }
 
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize, Clone)]
 pub enum PostprocessingStep {
     FfmpegReencode { target_fps: u32 }
 }
