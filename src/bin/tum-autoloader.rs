@@ -10,6 +10,7 @@ use serde_json;
 use tum_autoloader::postprocessing::perform_postprocessing_step;
 use structopt::StructOpt;
 use urlencoding;
+use battery;
 
 // const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
 // const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
@@ -37,6 +38,12 @@ struct CommandLineOptions {
 #[tokio::main]
 async fn main() -> GenericResult<()>{
     let commandline_options = CommandLineOptions::from_args();
+    // Obtain a battery handle if possible, otherwise ignore batteries
+    let battery_manager = battery::Manager::new();
+    let battery = battery_manager.ok()
+        .and_then(|m| m.batteries().ok())
+        .and_then(|mut batteries| batteries.next())
+        .and_then(|battery| battery.ok());
 
     dotenv::from_path(commandline_options.credentials_file)
         .or(Err(simple_error!("'.env' file with credentials not found.")))?;
@@ -99,20 +106,6 @@ async fn main() -> GenericResult<()>{
         if new_videos_count + new_documents_count > 0 && !commandline_options.discover {
             let downloads_result = process_downloads(&mut courses, 1, moodle_auth_cookies.clone()).await;
 
-            // let (new_videos_count, new_documents_count) = match check_for_updates_result {
-            //     Ok(count) => count,
-            //     Err(error) => {
-            //         if error.downcast_ref::<CheckForUpdatesError>().is_some() {
-            //             if let Ok(check_for_updates_error) = error.downcast::<CheckForUpdatesError>() {
-            //                 println!("Errors occured while checking for updates.");
-            //                 for error in check_for_updates_error.errors {
-            //                     println!("{}", error);
-            //                 }
-            //                 (check_for_updates_error.new_videos_count, check_for_updates_error.new_documents_count)
-            //             } else { unreachable!() }
-            //         } else { return Err(error); }
-            // }};
-
             let (successful_downloads_indices, failed_downloads) = match downloads_result {
                 Ok(successful_downloads_indices) => (successful_downloads_indices, vec![]),
                 Err(error) => {
@@ -123,21 +116,39 @@ async fn main() -> GenericResult<()>{
                     } else { return Err(error); }
                 }
             };
-            println!("Downloaded {} new videos.", successful_downloads_indices.len());
+            println!("Downloaded {} new files.", successful_downloads_indices.len());
+            for (course_index, file_index) in successful_downloads_indices {
+                println!("\tDownloaded {}.", &courses[course_index].files[file_index].file.metadata);
+            }
             if failed_downloads.len() > 0 {
-                println!("Failed to download {} videos.", failed_downloads.len());
+                println!("Failed to download {} files.", failed_downloads.len());
                 for (course_index, file_index, error) in failed_downloads {
-                    let course = &courses[course_index];
-                    let video = &course.files[file_index].file;
-                    println!("Download of {} failed:", video.metadata);
-                    println!("{}", error);
+                    println!("\tDownload of {} failed:", &courses[course_index].files[file_index].file.metadata);
+                    println!("\t{}", error);
                 }
             }
 
             let state_file_path = commandline_options.state_file.clone();
             save_courses(&commandline_options.state_file, &courses)?;
-            perform_postprocessing(&mut courses, 
-                |updated_courses| save_courses(&state_file_path, updated_courses))?;
+            // let report_postprocessing_progress = |updated_courses| {
+            //     // save_courses(&state_file_path, updated_courses)?;
+            //     // if let Some(ref battery) = battery {
+            //     //     if let battery::State::Discharging = battery.state() {
+            //     //         return Ok(false)
+            //     //     }
+            //     // }
+            //     // if let Some(battery::State::Discharging) = battery.as_ref().map(|s| s.state()) {
+            //     //     return Ok(false);
+            //     // }
+            //     return Ok(true);
+            // };
+            perform_postprocessing(&mut courses, |updated_courses| {
+                save_courses(&state_file_path, updated_courses)?;
+                if let Some(battery::State::Discharging) = battery.as_ref().map(|s| s.state()) {
+                    return Ok(false);
+                }
+                return Ok(true);
+            })?;
         }
         save_courses(&commandline_options.state_file, &courses)?;
 
@@ -358,20 +369,30 @@ fn load_courses<P>(path: P) -> GenericResult<Vec<Course>>
 
 fn perform_postprocessing<F>(courses: &mut Vec<Course>,
     progress_closure: F) -> GenericResult<()> 
-    where F: Fn(&Vec<Course>) -> GenericResult<()>
+    where F: Fn(&Vec<Course>) -> GenericResult<bool>
 {
+    // For each course and file (iterate over indices to avoid borrowing issues):
     for i in 0..courses.len() {
         for j in 0..courses[i].files.len() {
             let course = &mut courses[i];
             let file = &mut course.files[j];
-            // TODO: check that video_post_processing_steps.is_empty() 
+            // If postprocessing is pending: perform it
             if let DownloadState::PostprocessingPending(ref path) = file.download_state {
                 if file.file.is_video() {
                     for step in &course.video_post_processing_steps {
                         perform_postprocessing_step(file, step)?;
                     }
                     file.download_state = DownloadState::Completed(path.clone());
-                    progress_closure(courses)?;
+
+                    // Report progress (since postprocessing can be very expensive)
+                    // The progress_closure can return Ok(false) to indicate that
+                    // postprocessing should be stopped (e.g. because the device runs on battery now)
+                    let continue_postprocessing = progress_closure(courses)?;
+                    if !continue_postprocessing {
+                        return Ok(())
+                    }
+                } else {
+                    println!("Warning: postprocessing requested on non-video resource. Ignored.");
                 }
             }
         }
