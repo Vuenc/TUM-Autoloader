@@ -40,7 +40,7 @@ async fn main() -> GenericResult<()>{
     let commandline_options = CommandLineOptions::from_args();
     // Obtain a battery handle if possible, otherwise ignore batteries
     let battery_manager = battery::Manager::new();
-    let battery = battery_manager.ok()
+    let mut battery = battery_manager.ok()
         .and_then(|m| m.batteries().ok())
         .and_then(|mut batteries| batteries.next())
         .and_then(|battery| battery.ok());
@@ -129,26 +129,20 @@ async fn main() -> GenericResult<()>{
             }
 
             let state_file_path = commandline_options.state_file.clone();
-            save_courses(&commandline_options.state_file, &courses)?;
-            // let report_postprocessing_progress = |updated_courses| {
-            //     // save_courses(&state_file_path, updated_courses)?;
-            //     // if let Some(ref battery) = battery {
-            //     //     if let battery::State::Discharging = battery.state() {
-            //     //         return Ok(false)
-            //     //     }
-            //     // }
-            //     // if let Some(battery::State::Discharging) = battery.as_ref().map(|s| s.state()) {
-            //     //     return Ok(false);
-            //     // }
-            //     return Ok(true);
-            // };
-            perform_postprocessing(&mut courses, |updated_courses| {
+            let mut report_postprocessing_progress = |updated_courses: &_| {
                 save_courses(&state_file_path, updated_courses)?;
+                battery.iter_mut().for_each(|b| {b.refresh();});
                 if let Some(battery::State::Discharging) = battery.as_ref().map(|s| s.state()) {
                     return Ok(false);
                 }
                 return Ok(true);
-            })?;
+            };
+
+            // Run the reporting closure once to save the current state and only start postprocessing when
+            // the battery charging state allows it
+            if report_postprocessing_progress(&courses)? {
+                perform_postprocessing(&mut courses, report_postprocessing_progress)?;
+            }
         }
         save_courses(&commandline_options.state_file, &courses)?;
 
@@ -368,8 +362,8 @@ fn load_courses<P>(path: P) -> GenericResult<Vec<Course>>
 }
 
 fn perform_postprocessing<F>(courses: &mut Vec<Course>,
-    progress_closure: F) -> GenericResult<()> 
-    where F: Fn(&Vec<Course>) -> GenericResult<bool>
+    mut progress_closure: F) -> GenericResult<()> 
+    where F: FnMut(&Vec<Course>) -> GenericResult<bool>
 {
     // For each course and file (iterate over indices to avoid borrowing issues):
     for i in 0..courses.len() {
@@ -384,16 +378,16 @@ fn perform_postprocessing<F>(courses: &mut Vec<Course>,
                     }
                     file.download_state = DownloadState::Completed(path.clone());
 
-                    // Report progress (since postprocessing can be very expensive)
-                    // The progress_closure can return Ok(false) to indicate that
-                    // postprocessing should be stopped (e.g. because the device runs on battery now)
-                    let continue_postprocessing = progress_closure(courses)?;
-                    if !continue_postprocessing {
-                        return Ok(())
-                    }
                 } else {
                     println!("Warning: postprocessing requested on non-video resource. Ignored.");
                 }
+            }
+            // Report progress (since postprocessing can be very expensive)
+            // The progress_closure can return Ok(false) to indicate that
+            // postprocessing should be stopped (e.g. because the device runs on battery now)
+            let continue_postprocessing = progress_closure(courses)?;
+            if !continue_postprocessing {
+                return Ok(())
             }
         }
     }
