@@ -32,27 +32,35 @@ struct CommandLineOptions {
 
     /// In `discover` mode, videos/documents are only discovered, but set to not be automatically downloaded.
     #[structopt(long)]
-    discover: bool
+    discover: bool,
+
+    /// Print very detailed messages about what the program is doing
+    #[structopt(long)]
+    verbose: bool
 }
 
 #[tokio::main]
 async fn main() -> GenericResult<()>{
     let commandline_options = CommandLineOptions::from_args();
     // Obtain a battery handle if possible, otherwise ignore batteries
+    if commandline_options.verbose { println!("Setting up battery manager...") }
     let battery_manager = battery::Manager::new();
     let mut battery = battery_manager.ok()
         .and_then(|m| m.batteries().ok())
         .and_then(|mut batteries| batteries.next())
         .and_then(|battery| battery.ok());
 
+    if commandline_options.verbose { println!("Loading credentials file...") }
     dotenv::from_path(commandline_options.credentials_file)
         .or(Err(simple_error!("'.env' file with credentials not found.")))?;
     let username = &std::env::var("TUM_USERNAME")?;
     let password = &std::env::var("TUM_PASSWORD")?;
 
+    if commandline_options.verbose { println!("Setting up tokio interval scheduling...") }
     let mut interval = commandline_options.repeat_interval.map(|interval_minutes|
         tokio::time::interval(tokio::time::Duration::from_secs(interval_minutes * 60)));
 
+    if commandline_options.verbose { println!("Loading courses from state file...") }
     let mut courses = match load_courses(&commandline_options.state_file) {
         Ok(courses) => courses,
         Err(err) => {
@@ -64,10 +72,13 @@ async fn main() -> GenericResult<()>{
     let mut continue_next_check = true;
     while continue_next_check {
         if let Some(interval) = &mut interval {
+            if commandline_options.verbose { println!("Waiting for time interval until next check to expire...") }
             interval.tick().await;
         }
+        if commandline_options.verbose { println!("Login to moodle...") }
         let moodle_auth_cookies = moodle_login(&username, &password).await?;
 
+        if commandline_options.verbose { println!("Checking for updates on course sites...") }
         let check_for_updates_result = check_for_updates(&mut courses, moodle_auth_cookies.clone()).await;
         let (new_videos_count, new_documents_count) = match check_for_updates_result {
             Ok(count) => count,
@@ -86,12 +97,14 @@ async fn main() -> GenericResult<()>{
         println!("{} new videos and {} new documents discovered.", new_videos_count, new_documents_count);
 
         if commandline_options.discover {
+            if commandline_options.verbose { println!("Setting download states to None (discover mode)...") }
             for video in courses[0].files.iter_mut() {
                 video.download_state = DownloadState::None;
             }
         }
 
         if new_videos_count + new_documents_count > 0 && !commandline_options.discover {
+            if commandline_options.verbose { println!("Processing downloads...") }
             let downloads_result = process_downloads(&mut courses, 1, moodle_auth_cookies.clone()).await;
 
             let (successful_downloads_indices, failed_downloads) = match downloads_result {
@@ -117,21 +130,28 @@ async fn main() -> GenericResult<()>{
             }
 
             let state_file_path = commandline_options.state_file.clone();
+            let is_verbose = commandline_options.verbose;
             let mut report_postprocessing_progress = |updated_courses: &_| {
+                if is_verbose { println!("Postprocessing update: saving courses to state file...") }
                 save_courses(&state_file_path, updated_courses)?;
+                if is_verbose { println!("Refreshing battery state...") }
                 battery.iter_mut().for_each(|b| {b.refresh();});
                 if let Some(battery::State::Discharging) = battery.as_ref().map(|s| s.state()) {
+                    if is_verbose { println!("Battery state Discharging: Aborting Postprocessing...") }
                     return Ok(false);
                 }
+                if is_verbose { println!("Battery state OK: Continue Postprocessing...") }
                 return Ok(true);
             };
 
+            if commandline_options.verbose { println!("Starting postprocessing...") }
             // Run the reporting closure once to save the current state and only start postprocessing when
             // the battery charging state allows it
             if report_postprocessing_progress(&courses)? {
                 perform_postprocessing(&mut courses, report_postprocessing_progress)?;
             }
         }
+        if commandline_options.verbose { println!("Saving courses to state file...") }
         save_courses(&commandline_options.state_file, &courses)?;
 
         continue_next_check = interval.is_some();
