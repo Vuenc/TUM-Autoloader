@@ -57,19 +57,7 @@ async fn main() -> GenericResult<()>{
         Ok(courses) => courses,
         Err(err) => {
             println!("Error loading state: {:}", err);
-            println!("Using default configuration...");
-            vec![ Course {
-                url: "https://www.moodle.tum.de/course/view.php?idnumber=950576833".into(),
-                name: "Programming Languages".into(),
-                course_type: CourseType::Moodle,
-                video_download_directory: PathBuf::from("../../Studium/TUM Recordings/"),
-                file_download_directory: PathBuf::from("../../Studium/Programming Languages/"),
-                auto_download_mode: AutoDownloadMode::Videos,
-                files: vec![],
-                max_keep_days_videos: None,
-                max_keep_videos: None,
-                video_post_processing_steps: vec![PostprocessingStep::FfmpegReencode {target_fps: 30}]
-            }]
+            return Err(err);
         }
     };
 
