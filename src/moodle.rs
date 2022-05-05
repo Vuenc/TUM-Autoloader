@@ -168,6 +168,10 @@ fn detect_moodle_course_file(client: &reqwest::Client, url: &str, lecture_title:
     activity_title: String, depth: i32)
     -> Pin<Box<dyn Send + Future<Output=GenericResult<Option<CourseFileOrSubpage>>>>>
 {
+    if Url::parse(&url).is_err() {
+        // Don't try to follow an URL that can't even be parsed.
+        return Box::pin(async {GenericResult::Ok(None)});
+    }
     let detect_file_future = client.get(url)
         .send().err_into::<GenericError>()
         // store the final url (after redirects)
