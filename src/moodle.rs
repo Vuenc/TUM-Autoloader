@@ -1,5 +1,5 @@
 use reqwest::{self, Url};
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashSet, fmt::Display, pin::Pin, sync::Arc};
 use regex::Regex;
 use futures::{self, TryFutureExt, stream::{StreamExt, FuturesOrdered}};
 use select::{document::Document,
@@ -33,6 +33,7 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
     // Define before `download_futures` s.t. it is not dropped too early and referencing the Regex from a closure succeeds
     let panopto_video_url_regex = Regex::new(r#""VideoUrl":"(.*?)""#)?;
     let mut detect_futures: FuturesOrdered<futures::future::BoxFuture<_>> = FuturesOrdered::new();
+    let mut crawled_urls = HashSet::new();
     
     let resp = client.get(course_url).send().await?;
     { // Artificial scope s.t. the non-`Send` `course_page_dom` is dropped before the next .await
@@ -46,22 +47,18 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
             // Iterate through nodes that could be directly linked videos/documents
             for activity_node in section_node.find(Class("activityinstance"))
             {
-                // dbg!(&activity_node);
-                let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
                 if let Some(activity_url) = activity_node.find(Name("a")).next()
-                    .and_then(|n| n.attr("href")) 
+                    .and_then(|n| n.attr("href"))
                 {
-                    let activity_title = activity_node.find(Class("instancename")).next().map(|n| n.text()).unwrap_or_default();
-                    // TODO: Handle nested activity urls recursively
-                    let detect_file_future = client.get(activity_url)
-                        .send().err_into::<GenericError>()
-                        .map_ok(|resp| {
-                            let url = resp.url().to_string();
-                            moodle_course_file(url, lecture_title, section_title, activity_title)
-                        });
-                    detect_futures.push(Box::pin(detect_file_future));
+                    if crawled_urls.insert(activity_url) {
+                        let activity_title = activity_node.find(Class("instancename")).next().map(|n| n.text()).unwrap_or_default();
+                        // TODO: Handle nested activity urls recursively (not only here!)
+                        let detect_future = detect_moodle_course_file(&client, activity_url, lecture_title.clone(), section_title.clone(), activity_title);
+                        detect_futures.push(detect_future);
+                    }
                 }
             }
+
             // Iterate through nodes that could be embedded Panopto players
             for video_node in section_node.find(Name("iframe").and(Attr("src", ())))
             {
@@ -94,6 +91,20 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
                 }
             }
         }
+
+        // As fallback capture every link inside a "role=main" element (that has not been captured before)
+        for main_content_element in course_page_dom.find(Attr("role", "main"))
+        {
+            for link_node in main_content_element.find(Name("a")) {
+                if let Some(link_url) = link_node.attr("href") {
+                    // Insert the link url and only continue if not yet present
+                    if crawled_urls.insert(link_url) {
+                        let detect_future = detect_moodle_course_file(&client, link_url, lecture_title.clone(), String::new(), link_node.text());
+                        detect_futures.push(detect_future);
+                    }
+                }
+            }
+        }
     }
 
     let mut course_files = vec![];
@@ -112,6 +123,20 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
     } else {
         Err(MoodleCrawlingError{successful_detections: course_files, failed_detections: errors}.into())
     }
+}
+
+// Follows an URL through redirects and builds a CourseFile from the final url.
+fn detect_moodle_course_file(client: &reqwest::Client, activity_url: &str, lecture_title: String, section_title: String, activity_title: String)
+        -> Pin<Box<impl futures::Future<Output=GenericResult<Option<CourseFile>>>>>
+{
+    let detect_file_future = client.get(activity_url)
+        .send().err_into::<GenericError>()
+        // store the final url (after redirects)
+        .map_ok(|resp| {
+            let url = resp.url().to_string();
+            moodle_course_file(url, lecture_title, section_title, activity_title)
+        });
+    return Box::pin(detect_file_future);
 }
 
 fn moodle_course_file(url: String, lecture_title: String, section_title: String, activity_title: String) -> Option<CourseFile> {
