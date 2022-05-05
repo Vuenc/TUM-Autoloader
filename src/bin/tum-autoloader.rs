@@ -181,7 +181,7 @@ async fn check_for_updates(courses: &mut Vec<Course>,
     for course in courses {
         match course.course_type {
             CourseType::Moodle => {
-                let detection_result = detect_moodle_files(&course.url, moodle_auth_cookies.clone()).await;
+                let detection_result = detect_moodle_files(&course.url, moodle_auth_cookies.clone(), course.max_subpage_depth).await;
                 let mut moodle_files = match detection_result {
                     Ok(files) => files,
                     Err(error) => {

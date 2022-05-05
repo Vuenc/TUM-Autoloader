@@ -1,11 +1,13 @@
 use reqwest::{self, Url};
-use std::{collections::HashSet, fmt::Display, pin::Pin, sync::Arc};
+use std::{fmt::Display, pin::Pin, sync::Arc};
 use regex::Regex;
-use futures::{self, TryFutureExt, stream::{StreamExt, FuturesOrdered}};
+use futures::{self, TryFutureExt, stream::{StreamExt, FuturesOrdered}, Future, future::BoxFuture};
 use select::{document::Document,
             predicate::{Predicate, Attr, Class, Name, Text}};
 use simple_error::simple_error;
 use reqwest_cookie_store::CookieStoreMutex;
+use lazy_static::lazy_static;
+use flurry; // Provides a thread-safe hashset
 
 use crate::{GenericError, GenericResult, data::{CourseFileMetadata, CourseFileResource, CourseFile}};
 
@@ -23,22 +25,25 @@ impl Display for MoodleCrawlingError {
 
 impl std::error::Error for MoodleCrawlingError {}
 
-pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>) 
-        -> GenericResult<Vec<CourseFile>>
+lazy_static! {
+    static ref PANOPTO_VIDEO_URL_REGEX: Regex = Regex::new(r#""VideoUrl":"(.*?)""#).unwrap();
+}
+
+enum CourseFileOrSubpage { CourseFile(CourseFile), Subpage { subpage_depth: i32, subpage_url: String } }
+
+async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest::Client,
+    /*detect_futures: &mut FuturesOrdered<BoxFuture<'a, GenericResult<Option<CourseFileOrSubpage>>>>,*/
+    crawled_urls: &flurry::HashSet<String>, // mutable hashset (despite not declared &mut)
+    depth: i32) -> GenericResult<FuturesOrdered<BoxFuture<'a, GenericResult<Option<CourseFileOrSubpage>>>>>
 {
-    let client = reqwest::Client::builder()
-        .cookie_provider(moodle_auth_cookies.clone())
-        .build()?;
-        
-    // Define before `download_futures` s.t. it is not dropped too early and referencing the Regex from a closure succeeds
-    let panopto_video_url_regex = Regex::new(r#""VideoUrl":"(.*?)""#)?;
-    let mut detect_futures: FuturesOrdered<futures::future::BoxFuture<_>> = FuturesOrdered::new();
-    let mut crawled_urls = HashSet::new();
-    
-    let resp = client.get(course_url).send().await?;
+    let mut detect_futures: FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>> = FuturesOrdered::new();
+
+    let resp = client.get(&site_url).send().await?;
     { // Artificial scope s.t. the non-`Send` `course_page_dom` is dropped before the next .await
         let course_page_dom = Document::from(resp.text().await?.as_str());
         let lecture_title = course_page_dom.find(Class("page-header-headings")).next().map(|n| n.text()).unwrap_or_default();
+
+        let crawled_urls_guard = crawled_urls.guard(); // Required for `flurry` HashSet implementation
 
         // Iterate through main sections to capture their titles
         for section_node in course_page_dom.find(Class("section").and(Class("main"))) {
@@ -50,10 +55,9 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
                 if let Some(activity_url) = activity_node.find(Name("a")).next()
                     .and_then(|n| n.attr("href"))
                 {
-                    if crawled_urls.insert(activity_url) {
+                    if crawled_urls.insert(activity_url.to_owned(), &crawled_urls_guard) {
                         let activity_title = activity_node.find(Class("instancename")).next().map(|n| n.text()).unwrap_or_default();
-                        // TODO: Handle nested activity urls recursively (not only here!)
-                        let detect_future = detect_moodle_course_file(&client, activity_url, lecture_title.clone(), section_title.clone(), activity_title);
+                        let detect_future = detect_moodle_course_file(&client, activity_url, lecture_title.clone(), section_title.clone(), activity_title, depth);
                         detect_futures.push(detect_future);
                     }
                 }
@@ -69,7 +73,7 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
                     let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
                     let detect_video_future = client.get(panopto_url).send().err_into::<GenericError>()
                         .and_then(|resp| resp.text().err_into::<GenericError>())
-                        .map_ok(|text| {
+                        .map_ok(move |text| {
                             // The title is found in a heading with id 'title'
                             let video_title = {
                                 let panopto_dom = Document::from(text.as_str());
@@ -78,13 +82,13 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
                             };
 
                             // The url pointing to the video in mp4 format is found hardcoded in the embedded
-                            // <script>, which is matched by `panopto_video_url_regex`
-                            panopto_video_url_regex.captures(&text)
+                            // <script>, which is matched by `PANOPTO_VIDEO_URL_REGEX`
+                            PANOPTO_VIDEO_URL_REGEX.captures(&text)
                                 .and_then(|captures| captures.get(1))
                                 .and_then(move |url_match| {
                                     // In the JavaScript code, / is escaped as \/
                                     let video_url = url_match.as_str().replace("\\/", "/");
-                                    moodle_course_file(video_url, lecture_title, section_title, video_title)
+                                    moodle_course_file(video_url, lecture_title, section_title, video_title, depth)
                                 })
                         });
                     detect_futures.push(Box::pin(detect_video_future));
@@ -98,26 +102,60 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
             for link_node in main_content_element.find(Name("a")) {
                 if let Some(link_url) = link_node.attr("href") {
                     // Insert the link url and only continue if not yet present
-                    if crawled_urls.insert(link_url) {
-                        let detect_future = detect_moodle_course_file(&client, link_url, lecture_title.clone(), String::new(), link_node.text());
+                    if crawled_urls.insert(link_url.to_owned(), &crawled_urls_guard) {
+                        let detect_future = detect_moodle_course_file(&client, link_url, lecture_title.clone(), String::new(), link_node.text(), depth);
                         detect_futures.push(detect_future);
                     }
                 }
             }
         }
     }
+    Ok(detect_futures)
+}
+
+pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>, max_depth: i32)
+        -> GenericResult<Vec<CourseFile>>
+{
+    let client = reqwest::Client::builder()
+        .cookie_provider(moodle_auth_cookies.clone())
+        .build()?;
+
+    // Define before `download_futures` s.t. it is not dropped too early and referencing the Regex from a closure succeeds
+    // let mut detect_futures: FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>> = FuturesOrdered::new();
+    let crawled_urls = flurry::HashSet::new();
+    let mut subpage_futures: FuturesOrdered<BoxFuture<GenericResult<FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>>>>> = FuturesOrdered::new();
+
+    let mut detect_futures = detect_moodle_files_and_subpages(course_url.to_owned(), &client, &crawled_urls, 0).await?;
 
     let mut course_files = vec![];
     let mut errors: Vec<GenericError> = vec![];
-    while let Some(result) = detect_futures.next().await {
-        match result {
-            Ok(Some(course_video)) => {
-                course_files.push(course_video);
-            },
-            Ok(None) => {} // Ignore (e.g. unwanted file types)
-            Err(error) => { errors.push(error.into()); } // Like this for now, but just skipping would also be an option
+
+    while detect_futures.len() > 0 {
+        while let Some(result) = detect_futures.next().await {
+            match result {
+                Ok(Some(CourseFileOrSubpage::CourseFile(course_file))) => {
+                    course_files.push(course_file);
+                },
+                Ok(Some(CourseFileOrSubpage::Subpage{ subpage_url, subpage_depth })) => {
+                    if subpage_depth <= max_depth {
+                        let subpage_future = detect_moodle_files_and_subpages(subpage_url, &client, &crawled_urls, subpage_depth);
+                        subpage_futures.push(Box::pin(subpage_future));
+                    }
+                },
+                Ok(None) => {} // Ignore (e.g. unwanted file types)
+                Err(error) => { errors.push(error.into()); } // Like this for now, but just skipping would also be an option
+            }
+        }
+        if let Some(subpage_result) = subpage_futures.next().await {
+            match subpage_result {
+                Ok(subpage_file_detect_futures) => {
+                    detect_futures = subpage_file_detect_futures;
+                },
+                Err(error) => { errors.push(error.into()); } // Like this for now, but just skipping would also be an option
+            }
         }
     }
+
     if errors.len() == 0 {
         Ok(course_files)
     } else {
@@ -126,43 +164,47 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
 }
 
 // Follows an URL through redirects and builds a CourseFile from the final url.
-fn detect_moodle_course_file(client: &reqwest::Client, activity_url: &str, lecture_title: String, section_title: String, activity_title: String)
-        -> Pin<Box<impl futures::Future<Output=GenericResult<Option<CourseFile>>>>>
+fn detect_moodle_course_file(client: &reqwest::Client, url: &str, lecture_title: String, section_title: String,
+    activity_title: String, depth: i32)
+    -> Pin<Box<dyn Send + Future<Output=GenericResult<Option<CourseFileOrSubpage>>>>>
 {
-    let detect_file_future = client.get(activity_url)
+    let detect_file_future = client.get(url)
         .send().err_into::<GenericError>()
         // store the final url (after redirects)
-        .map_ok(|resp| {
+        .map_ok(move |resp| {
             let url = resp.url().to_string();
-            moodle_course_file(url, lecture_title, section_title, activity_title)
+            moodle_course_file(url, lecture_title, section_title, activity_title, depth)
         });
     return Box::pin(detect_file_future);
 }
 
-fn moodle_course_file(url: String, lecture_title: String, section_title: String, activity_title: String) -> Option<CourseFile> {
+fn moodle_course_file(url: String, lecture_title: String, section_title: String, activity_title: String, depth: i32) -> Option<CourseFileOrSubpage> {
     let metadata = CourseFileMetadata::MoodleActivity { lecture_title, section_title, activity_title };
-    let url_parsed = Url::parse(&url);
-    let file_extension = url_parsed.ok()
-        .and_then(|url_parsed| url_parsed.path_segments()
+    let url_parsed = Url::parse(&url).ok()?;
+    let file_extension = url_parsed.path_segments()
         .and_then(|p| p.into_iter().last())
         .map(|s| s.rfind(".")
-        .map(|i| (&s[i+1..]).to_lowercase())));
+        .map(|i| (&s[i+1..]).to_lowercase()));
 
-    let resource = match file_extension {
+    let (resource, subpage) = match file_extension {
         Some(Some(extension)) => {
             match extension.as_str() {
-                "mp4" => Some(CourseFileResource::Mp4File {url}),
-                "m3u8" => Some(CourseFileResource::HlsStream {main_m3u8_url: url}),
-                "html" | "php" => None, // HTML and PHP files are ignored
-                _ => Some(CourseFileResource::Document {url, file_extension: Some(extension)})
+                "mp4" => (Some(CourseFileResource::Mp4File {url}), None),
+                "m3u8" => (Some(CourseFileResource::HlsStream {main_m3u8_url: url}), None),
+                // HTML and PHP files are considered to link to subpages
+                "html" | "php" => (None, Some(CourseFileOrSubpage::Subpage { subpage_url: url, subpage_depth: depth + 1})),
+                _ => (Some(CourseFileResource::Document {url, file_extension: Some(extension)}), None)
             }
         }
         // Some(None) means: URL parsing worked, but there is not . indicating a file extension. For now: ignore such files.
-        Some(None) => None, // alternatively: Some(CourseFileResource::Document {url, file_extension: None}),
+        Some(None) => (None, None), // alternatively: Some(CourseFileResource::Document {url, file_extension: None}),
         // None means: URL parsing failed
-        None => None
+        None => (None, None)
     };
-    resource.map(|resource| CourseFile { metadata, resource })
+    if let Some(resource) = resource {
+        return Some(CourseFileOrSubpage::CourseFile(CourseFile { metadata, resource }));
+    }
+    return subpage;
 }
 
 fn extract_html_input_value<'a>(document: &'a Document, input_name: &str) -> GenericResult<&'a str> {

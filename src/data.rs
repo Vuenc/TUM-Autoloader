@@ -109,7 +109,9 @@ pub struct Course {
     pub files: Vec<CourseFileDownload<CourseFile>>,
     pub max_keep_days_videos: Option<i32>,
     pub max_keep_videos: Option<i32>,
-    pub video_post_processing_steps: Vec<PostprocessingStep>
+    pub video_post_processing_steps: Vec<PostprocessingStep>,
+    #[serde(default)]
+    pub max_subpage_depth: i32
     /* 
     id
     site url, course name, download directory, re-check interval (seconds), 
