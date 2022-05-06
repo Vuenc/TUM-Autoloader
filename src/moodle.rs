@@ -8,6 +8,7 @@ use simple_error::simple_error;
 use reqwest_cookie_store::CookieStoreMutex;
 use lazy_static::lazy_static;
 use flurry; // Provides a thread-safe hashset
+use std::time::Duration;
 
 use crate::{GenericError, GenericResult, data::{CourseFileMetadata, CourseFileResource, CourseFile}};
 
@@ -27,6 +28,7 @@ impl std::error::Error for MoodleCrawlingError {}
 
 lazy_static! {
     static ref PANOPTO_VIDEO_URL_REGEX: Regex = Regex::new(r#""VideoUrl":"(.*?)""#).unwrap();
+    static ref DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
 enum CourseFileOrSubpage { CourseFile(CourseFile), Subpage { subpage_depth: i32, subpage_url: String } }
@@ -38,7 +40,7 @@ async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest
 {
     let mut detect_futures: FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>> = FuturesOrdered::new();
 
-    let resp = client.get(&site_url).send().await?;
+    let resp = client.get(&site_url).timeout(*DEFAULT_TIMEOUT).send().await?;
     { // Artificial scope s.t. the non-`Send` `course_page_dom` is dropped before the next .await
         let course_page_dom = Document::from(resp.text().await?.as_str());
         let lecture_title = course_page_dom.find(Class("page-header-headings")).next().map(|n| n.text()).unwrap_or_default();
@@ -71,7 +73,7 @@ async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest
                     // Recieve embedded player HTML and extract video url and title from it
                     let panopto_url = video_node.attr("src").unwrap();
                     let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
-                    let detect_video_future = client.get(panopto_url).send().err_into::<GenericError>()
+                    let detect_video_future = client.get(panopto_url).timeout(*DEFAULT_TIMEOUT).send().err_into::<GenericError>()
                         .and_then(|resp| resp.text().err_into::<GenericError>())
                         .map_ok(move |text| {
                             // The title is found in a heading with id 'title'
@@ -173,6 +175,7 @@ fn detect_moodle_course_file(client: &reqwest::Client, url: &str, lecture_title:
         return Box::pin(async {GenericResult::Ok(None)});
     }
     let detect_file_future = client.get(url)
+        .timeout(*DEFAULT_TIMEOUT)
         .send().err_into::<GenericError>()
         // store the final url (after redirects)
         .map_ok(move |resp| {
@@ -231,7 +234,7 @@ pub async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<C
     const LOGIN_LINK_TEXT: &str = "TUM-Kennung";
 
     // Get Shibboleth login url by parsing moodle homepage
-    let resp = client.get(MOODLE_URL).send().await?;
+    let resp = client.get(MOODLE_URL).timeout(*DEFAULT_TIMEOUT).send().await?;
     let login_url = {
         let moodle_homepage_dom = Document::from(resp.text().await?.as_str());
         moodle_homepage_dom.find(Name("a").descendant(Text))
@@ -241,7 +244,7 @@ pub async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<C
     };
 
     // Get csrf token from Shibboleth login form
-    let resp = client.get(login_url).send().await?;
+    let resp = client.get(login_url).timeout(*DEFAULT_TIMEOUT).send().await?;
     let shibboleth_login_url = resp.url().to_string();
     let csrf_token = {
         let shibboleth_login_dom = Document::from(resp.text().await?.as_str());
