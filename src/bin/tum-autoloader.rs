@@ -3,10 +3,9 @@ use std::{fmt::Display, path::{Path, PathBuf}, pin::Pin, sync::Arc};
 use futures::{Future, StreamExt, TryFutureExt, stream::{FuturesOrdered}};
 use tum_autoloader::{GenericError, GenericResult, data::CourseFileResource, download::{download_mp4, download_document},
     moodle::{MoodleCrawlingError, detect_moodle_files, moodle_login},
-    tum_live::{tum_live_login, detect_tum_live_videos},
     http_headers::DEFAULT_HEADERS};
 use simple_error::simple_error;
-use tum_autoloader::data::{Course, CourseFileDownload, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
+use tum_autoloader::data::{Course, CourseFileDownload, CourseType, DownloadState};
 use serde_json;
 use tum_autoloader::postprocessing::perform_postprocessing_step;
 use structopt::StructOpt;
@@ -137,7 +136,11 @@ async fn main() -> GenericResult<()>{
                 if is_verbose { println!("Postprocessing update: saving courses to state file...") }
                 save_courses(&state_file_path, updated_courses)?;
                 if is_verbose { println!("Refreshing battery state...") }
-                battery.iter_mut().for_each(|b| {b.refresh();});
+                if let Some(ref mut battery) = battery {
+                    if let Err(err) = battery.refresh() {
+                        if is_verbose { println!("Warning - Could not refresh battery state: {:}", err) }
+                    }
+                }
                 if let Some(battery::State::Discharging) = battery.as_ref().map(|s| s.state()) {
                     if is_verbose { println!("Battery state Discharging: Aborting Postprocessing...") }
                     return Ok(false);

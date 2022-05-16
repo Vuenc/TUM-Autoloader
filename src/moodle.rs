@@ -72,29 +72,7 @@ async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest
             {
                 // Video in embedded Panopto player
                 if video_node.name() == Some("iframe") && video_node.attr("src").unwrap().contains("panopto") {
-                    // Recieve embedded player HTML and extract video url and title from it
-                    let panopto_url = video_node.attr("src").unwrap();
-                    let (lecture_title, section_title) = (lecture_title.clone(), section_title.clone());
-                    let detect_video_future = client.get(panopto_url).timeout(*DEFAULT_TIMEOUT).send().err_into::<GenericError>()
-                        .and_then(|resp| resp.text().err_into::<GenericError>())
-                        .map_ok(move |text| {
-                            // The title is found in a heading with id 'title'
-                            let video_title = {
-                                let panopto_dom = Document::from(text.as_str());
-                                panopto_dom.find(Attr("id", "title"))
-                                    .next().map_or(String::new(), |title| title.text().trim().to_owned())
-                            };
-
-                            // The url pointing to the video in mp4 format is found hardcoded in the embedded
-                            // <script>, which is matched by `PANOPTO_VIDEO_URL_REGEX`
-                            PANOPTO_VIDEO_URL_REGEX.captures(&text)
-                                .and_then(|captures| captures.get(1))
-                                .and_then(move |url_match| {
-                                    // In the JavaScript code, / is escaped as \/
-                                    let video_url = url_match.as_str().replace("\\/", "/");
-                                    moodle_course_file(video_url, lecture_title, section_title, video_title, depth)
-                                })
-                        });
+                    let detect_video_future = detect_panopto_video_file(video_node, &lecture_title, &section_title, client, depth);
                     detect_futures.push(Box::pin(detect_video_future));
                 }
             }
@@ -115,6 +93,35 @@ async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest
         }
     }
     Ok(detect_futures)
+}
+
+fn detect_panopto_video_file(video_node: select::node::Node, lecture_title: &str, section_title: &str, client: &reqwest::Client, depth: i32)
+        -> Pin<Box<dyn Send + Future<Output=GenericResult<Option<CourseFileOrSubpage>>>>>
+{
+    // Recieve embedded player HTML and extract video url and title from it
+    let panopto_url = video_node.attr("src").unwrap();
+    let (lecture_title, section_title) = (lecture_title.to_owned(), section_title.to_owned());
+    let detect_video_future = client.get(panopto_url).timeout(*DEFAULT_TIMEOUT).send().err_into::<GenericError>()
+        .and_then(|resp| resp.text().err_into::<GenericError>())
+        .map_ok(move |text| {
+            // The title is found in a heading with id 'title'
+            let video_title = {
+                let panopto_dom = Document::from(text.as_str());
+                panopto_dom.find(Attr("id", "title"))
+                    .next().map_or(String::new(), |title| title.text().trim().to_owned())
+            };
+
+            // The url pointing to the video in mp4 format is found hardcoded in the embedded
+            // <script>, which is matched by `PANOPTO_VIDEO_URL_REGEX`
+            PANOPTO_VIDEO_URL_REGEX.captures(&text)
+                .and_then(|captures| captures.get(1))
+                .and_then(move |url_match| {
+                    // In the JavaScript code, / is escaped as \/
+                    let video_url = url_match.as_str().replace("\\/", "/");
+                    moodle_course_file(video_url, lecture_title, section_title, video_title, depth)
+                })
+        });
+    return Box::pin(detect_video_future)
 }
 
 pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<CookieStoreMutex>, max_depth: i32)
@@ -203,6 +210,7 @@ fn moodle_course_file(url: String, lecture_title: String, section_title: String,
                 "m3u8" => (Some(CourseFileResource::HlsStream {main_m3u8_url: url}), None),
                 // HTML and PHP files are considered to link to subpages
                 "html" | "php" => (None, Some(CourseFileOrSubpage::Subpage { subpage_url: url, subpage_depth: depth + 1})),
+                "aspx" => (None, None), // Ignore aspx files (aspx links appear for Panopto videos, but are not useful to us)
                 _ => (Some(CourseFileResource::Document {url, file_extension: Some(extension)}), None)
             }
         }

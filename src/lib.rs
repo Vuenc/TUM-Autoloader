@@ -2,6 +2,7 @@ use std::error::Error;
 
 pub mod data;
 pub mod moodle;
+#[allow(dead_code, unused_variables)] // As of now, `download` contains unused legacy functions possibly needed in the future for proper TUM Live integration
 pub mod download;
 pub mod tum_live;
 pub mod postprocessing;
