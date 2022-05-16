@@ -3,7 +3,8 @@ use std::{fmt::Display, path::{Path, PathBuf}, pin::Pin, sync::Arc};
 use futures::{Future, StreamExt, TryFutureExt, stream::{FuturesOrdered}};
 use tum_autoloader::{GenericError, GenericResult, data::CourseFileResource, download::{download_mp4, download_document},
     moodle::{MoodleCrawlingError, detect_moodle_files, moodle_login},
-    tum_live::{tum_live_login, detect_tum_live_videos}};
+    tum_live::{tum_live_login, detect_tum_live_videos},
+    http_headers::DEFAULT_HEADERS};
 use simple_error::simple_error;
 use tum_autoloader::data::{Course, CourseFileDownload, CourseType, DownloadState, AutoDownloadMode, PostprocessingStep};
 use serde_json;
@@ -14,6 +15,7 @@ use battery;
 
 // const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
 // const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
+
 
 #[derive(StructOpt)]
 #[structopt(name = "tum-autoloader", about = "Automatically download lecture recordings and files from TUM websites.")]
@@ -251,6 +253,7 @@ async fn process_downloads(courses: &mut Vec<Course>, max_parallel_downloads: us
 
     let client = reqwest::Client::builder()
         .cookie_provider(moodle_auth_cookies.clone())
+        .default_headers((*DEFAULT_HEADERS).clone())
         .build()?;
 
     // Store course and video indices of all, successful and failed downloads

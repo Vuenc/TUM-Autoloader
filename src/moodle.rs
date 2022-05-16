@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use flurry; // Provides a thread-safe hashset
 use std::time::Duration;
 
-use crate::{GenericError, GenericResult, data::{CourseFileMetadata, CourseFileResource, CourseFile}};
+use crate::{GenericError, GenericResult, data::{CourseFileMetadata, CourseFileResource, CourseFile}, http_headers::DEFAULT_HEADERS};
 
 #[derive(Debug)]
 pub struct MoodleCrawlingError {
@@ -30,6 +30,8 @@ lazy_static! {
     static ref PANOPTO_VIDEO_URL_REGEX: Regex = Regex::new(r#""VideoUrl":"(.*?)""#).unwrap();
     static ref DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 }
+
+static PANOPTO_LOGIN_URL: &str = "https://tum.cloud.panopto.eu/Panopto/Pages/Auth/Login.aspx?Auth=Viewer&instance=moodle&AllowBounce=true";
 
 enum CourseFileOrSubpage { CourseFile(CourseFile), Subpage { subpage_depth: i32, subpage_url: String } }
 
@@ -120,6 +122,7 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
 {
     let client = reqwest::Client::builder()
         .cookie_provider(moodle_auth_cookies.clone())
+        .default_headers((*DEFAULT_HEADERS).clone())
         .build()?;
 
     // Define before `download_futures` s.t. it is not dropped too early and referencing the Regex from a closure succeeds
@@ -228,6 +231,7 @@ pub async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<C
     // Build a `reqwest` Client that uses the cookie store
     let client = reqwest::Client::builder()
         .cookie_provider(cookie_store.clone())
+        .default_headers((*DEFAULT_HEADERS).clone())
         .build()?;
 
     const MOODLE_URL: &str = "https://www.moodle.tum.de/";
@@ -272,9 +276,15 @@ pub async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<C
     let resp = client.post(post_url).form(&params).send().await?;
 
     // Make sure the last request succeeded
-    if resp.status().is_success() {
-        Ok(cookie_store)
-    } else {
-        Err(simple_error!("Moodle Shibboleth login did not succeed!").into())
+    if !resp.status().is_success() {
+        return Err(simple_error!("Moodle Shibboleth login did not succeed!").into())
     }
+
+    // Before Panopto videos can be downloaded, a login must be performed once
+    let panopto_login_resp = client.get(PANOPTO_LOGIN_URL).send().await?;
+    if !panopto_login_resp.status().is_success() {
+        return Err(simple_error!("Panopto login did not succeed!").into())
+    }
+
+    return Ok(cookie_store)
 }
