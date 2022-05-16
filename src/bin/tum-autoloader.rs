@@ -1,6 +1,6 @@
 use std::{fmt::Display, path::{Path, PathBuf}, pin::Pin, sync::Arc};
 
-use futures::{Future, StreamExt, TryFutureExt, stream::{FuturesOrdered}};
+use futures::{Future, StreamExt, TryFutureExt, stream::FuturesOrdered};
 use tum_autoloader::{GenericError, GenericResult, data::CourseFileResource, download::{download_mp4, download_document},
     moodle::{MoodleCrawlingError, detect_moodle_files, moodle_login},
     http_headers::DEFAULT_HEADERS};
@@ -11,10 +11,6 @@ use tum_autoloader::postprocessing::perform_postprocessing_step;
 use structopt::StructOpt;
 use urlencoding;
 use battery;
-
-// const STATE_FILE_PATH: &str = "../../Studium/TUM Recordings/autoloader.json";
-// const RECHECK_INTERVAL_SECONDS: u64 = 60 * 1; // 30 minutes
-
 
 #[derive(StructOpt)]
 #[structopt(name = "tum-autoloader", about = "Automatically download lecture recordings and files from TUM websites.")]

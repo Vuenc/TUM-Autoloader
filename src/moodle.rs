@@ -31,13 +31,16 @@ lazy_static! {
     static ref DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
-static PANOPTO_LOGIN_URL: &str = "https://tum.cloud.panopto.eu/Panopto/Pages/Auth/Login.aspx?Auth=Viewer&instance=moodle&AllowBounce=true";
+const PANOPTO_LOGIN_URL: &str = "https://tum.cloud.panopto.eu/Panopto/Pages/Auth/Login.aspx?Auth=Viewer&instance=moodle&AllowBounce=true";
+const MOODLE_URL: &str = "https://www.moodle.tum.de/";
+const MOODLE_LOGIN_LINK_TEXT: &str = "TUM-Kennung";
 
 enum CourseFileOrSubpage { CourseFile(CourseFile), Subpage { subpage_depth: i32, subpage_url: String } }
 
+type CourseFileFuture = Pin<Box<dyn Send + Future<Output=GenericResult<Option<CourseFileOrSubpage>>>>>;
+
 async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest::Client,
-    /*detect_futures: &mut FuturesOrdered<BoxFuture<'a, GenericResult<Option<CourseFileOrSubpage>>>>,*/
-    crawled_urls: &flurry::HashSet<String>, // mutable hashset (despite not declared &mut)
+    crawled_urls: &flurry::HashSet<String>, // mutable threadsafe hashset (despite not declared &mut)
     depth: i32) -> GenericResult<FuturesOrdered<BoxFuture<'a, GenericResult<Option<CourseFileOrSubpage>>>>>
 {
     let mut detect_futures: FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>> = FuturesOrdered::new();
@@ -96,7 +99,7 @@ async fn detect_moodle_files_and_subpages<'a>(site_url: String, client: &reqwest
 }
 
 fn detect_panopto_video_file(video_node: select::node::Node, lecture_title: &str, section_title: &str, client: &reqwest::Client, depth: i32)
-        -> Pin<Box<dyn Send + Future<Output=GenericResult<Option<CourseFileOrSubpage>>>>>
+        -> CourseFileFuture
 {
     // Recieve embedded player HTML and extract video url and title from it
     let panopto_url = video_node.attr("src").unwrap();
@@ -132,17 +135,16 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
         .default_headers((*DEFAULT_HEADERS).clone())
         .build()?;
 
-    // Define before `download_futures` s.t. it is not dropped too early and referencing the Regex from a closure succeeds
-    // let mut detect_futures: FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>> = FuturesOrdered::new();
+    // Set up future collections and a threadsafe HashSet to track all crawled urls
     let crawled_urls = flurry::HashSet::new();
     let mut subpage_futures: FuturesOrdered<BoxFuture<GenericResult<FuturesOrdered<BoxFuture<GenericResult<Option<CourseFileOrSubpage>>>>>>> = FuturesOrdered::new();
-
     let mut detect_futures = detect_moodle_files_and_subpages(course_url.to_owned(), &client, &crawled_urls, 0).await?;
 
     let mut course_files = vec![];
     let mut errors: Vec<GenericError> = vec![];
 
     while detect_futures.len() > 0 {
+        // Complete all currently available file detection futures
         while let Some(result) = detect_futures.next().await {
             match result {
                 Ok(Some(CourseFileOrSubpage::CourseFile(course_file))) => {
@@ -158,6 +160,7 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
                 Err(error) => { errors.push(error.into()); } // Like this for now, but just skipping would also be an option
             }
         }
+        // Complete the next subpage detection future and collect nested file detection futures to be executed next
         if let Some(subpage_result) = subpage_futures.next().await {
             match subpage_result {
                 Ok(subpage_file_detect_futures) => {
@@ -178,7 +181,7 @@ pub async fn detect_moodle_files(course_url: &str, moodle_auth_cookies: Arc<Cook
 // Follows an URL through redirects and builds a CourseFile from the final url.
 fn detect_moodle_course_file(client: &reqwest::Client, url: &str, lecture_title: String, section_title: String,
     activity_title: String, depth: i32)
-    -> Pin<Box<dyn Send + Future<Output=GenericResult<Option<CourseFileOrSubpage>>>>>
+    -> CourseFileFuture
 {
     if Url::parse(&url).is_err() {
         // Don't try to follow an URL that can't even be parsed.
@@ -242,17 +245,14 @@ pub async fn moodle_login(username: &str, password: &str) -> GenericResult<Arc<C
         .default_headers((*DEFAULT_HEADERS).clone())
         .build()?;
 
-    const MOODLE_URL: &str = "https://www.moodle.tum.de/";
-    const LOGIN_LINK_TEXT: &str = "TUM-Kennung";
-
     // Get Shibboleth login url by parsing moodle homepage
     let resp = client.get(MOODLE_URL).timeout(*DEFAULT_TIMEOUT).send().await?;
     let login_url = {
         let moodle_homepage_dom = Document::from(resp.text().await?.as_str());
         moodle_homepage_dom.find(Name("a").descendant(Text))
-            .find(|node| node.text().contains(LOGIN_LINK_TEXT))
+            .find(|node| node.text().contains(MOODLE_LOGIN_LINK_TEXT))
             .and_then(|node| node.parent().unwrap().attr("href"))
-            .ok_or(Box::new(simple_error!("Could not find link with text {} on moodle homepage", LOGIN_LINK_TEXT)))?.to_owned()
+            .ok_or(Box::new(simple_error!("Could not find link with text {} on moodle homepage", MOODLE_LOGIN_LINK_TEXT)))?.to_owned()
     };
 
     // Get csrf token from Shibboleth login form
